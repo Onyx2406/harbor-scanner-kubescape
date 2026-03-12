@@ -1,0 +1,17 @@
+apiVersion: v2
+name: harbor-scanner-kubescape
+description: Harbor Scanner Adapter for Kubescape image vulnerability scanning
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/goharbor/harbor-scanner-kubescape
+sources:
+  - https://github.com/goharbor/harbor-scanner-kubescape
+maintainers:
+  - name: Onyx2406
+keywords:
+  - harbor
+  - kubescape
+  - vulnerability
+  - scanner
+  - security

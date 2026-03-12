@@ -1,0 +1,47 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/goharbor/harbor-scanner-kubescape
+  tag: ""  # Defaults to Chart appVersion
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 8443
+
+# Scanner adapter configuration
+scanner:
+  # Address to listen on
+  apiAddr: ":8443"
+  # Base URL of the kubevuln service in the cluster
+  kubevulnURL: "http://kubevuln.kubescape.svc.cluster.local:8080"
+  # Kubernetes namespace where Kubescape components run
+  kubevulnNamespace: "kubescape"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
