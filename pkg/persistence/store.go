@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"time"
 
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
 )
@@ -32,12 +33,18 @@ func (s ScanJobStatus) String() string {
 }
 
 // ScanJob represents a scan job with its status and result.
+//
+// TerminalAt is set when Status transitions to Finished or Failed. Stores
+// that retain finished/failed jobs for a bounded window (e.g. the in-memory
+// store) use this timestamp to decide when to evict an entry. A zero
+// TerminalAt means the job has not yet reached a terminal state.
 type ScanJob struct {
-	ID      string
-	Request harbor.ScanRequest
-	Status  ScanJobStatus
-	Report  harbor.ScanReport
-	Error   string
+	ID         string
+	Request    harbor.ScanRequest
+	Status     ScanJobStatus
+	Report     harbor.ScanReport
+	Error      string
+	TerminalAt time.Time
 }
 
 // Store provides persistence for scan jobs.
