@@ -30,24 +30,44 @@ spec:
               value: {{ .Values.scanner.kubevulnURL | quote }}
             - name: KUBEVULN_NAMESPACE
               value: {{ .Values.scanner.kubevulnNamespace | quote }}
+            {{- if .Values.tls.enabled }}
+            - name: SCANNER_API_TLS_CERT
+              value: "/etc/harbor-scanner-kubescape/tls/tls.crt"
+            - name: SCANNER_API_TLS_KEY
+              value: "/etc/harbor-scanner-kubescape/tls/tls.key"
+            {{- end }}
           ports:
-            - name: http
-              containerPort: 8443
+            - name: api
+              containerPort: {{ .Values.service.port }}
               protocol: TCP
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/harbor-scanner-kubescape/tls
+              readOnly: true
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /probe/healthy
-              port: http
+              port: api
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /probe/ready
-              port: http
+              port: api
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ required "tls.secretName is required when tls.enabled is true" .Values.tls.secretName }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -23,6 +23,6 @@ USER scanner
 
 COPY --from=builder /app/harbor-scanner-kubescape /usr/local/bin/harbor-scanner-kubescape
 
-EXPOSE 8443
+EXPOSE 8080
 
 ENTRYPOINT ["harbor-scanner-kubescape"]

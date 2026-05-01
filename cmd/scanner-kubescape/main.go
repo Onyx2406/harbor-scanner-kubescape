@@ -103,9 +103,21 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		close(shutdownComplete)
 	}()
 
-	slog.Info("Listening", slog.String("addr", cfg.API.Addr))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
+	if cfg.API.TLSEnabled() {
+		slog.Info("Listening (TLS)",
+			slog.String("addr", cfg.API.Addr),
+			slog.String("cert", cfg.API.TLSCertFile),
+		)
+		if err := srv.ListenAndServeTLS(cfg.API.TLSCertFile, cfg.API.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+	} else {
+		slog.Info("Listening (plain HTTP — terminate TLS at ingress/service mesh)",
+			slog.String("addr", cfg.API.Addr),
+		)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
+		}
 	}
 
 	<-shutdownComplete

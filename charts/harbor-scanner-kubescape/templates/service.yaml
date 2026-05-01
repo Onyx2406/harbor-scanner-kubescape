@@ -8,8 +8,9 @@ spec:
   type: {{ .Values.service.type }}
   ports:
     - port: {{ .Values.service.port }}
-      targetPort: http
+      targetPort: api
       protocol: TCP
-      name: http
+      name: api
+      appProtocol: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}
   selector:
     {{- include "harbor-scanner-kubescape.selectorLabels" . | nindent 4 }}
