@@ -16,6 +16,7 @@ import (
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/config"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/k8s"
+	"github.com/google/go-containerregistry/pkg/name"
 )
 
 // Scanner interfaces with kubevuln to perform image vulnerability scanning.
@@ -117,15 +118,37 @@ func (s *kubevulnScanner) TriggerScan(ctx context.Context, req harbor.ScanReques
 	return nil
 }
 
-// BuildImageRef constructs a full image reference from a Harbor scan request.
+// BuildImageRef constructs a full image reference from a Harbor scan request,
+// then applies the same normalization that kubevuln applies before computing
+// VulnerabilityManifest CRD names. Without this, shortname inputs (e.g.
+// docker.io/nginx:latest, or any reference that go-containerregistry
+// rewrites) would produce a different slug here than in kubevuln, and the
+// CRD lookup would never resolve. See issue #4.
 func BuildImageRef(req harbor.ScanRequest) string {
+	raw := buildRawImageRef(req)
+	return normalizeImageRef(raw)
+}
+
+func buildRawImageRef(req harbor.ScanRequest) string {
 	registryURL, err := url.Parse(req.Registry.URL)
 	if err != nil {
 		return fmt.Sprintf("%s@%s", req.Artifact.Repository, req.Artifact.Digest)
 	}
-
 	host := registryURL.Host
 	return fmt.Sprintf("%s/%s@%s", host, req.Artifact.Repository, req.Artifact.Digest)
+}
+
+// normalizeImageRef mirrors kubevuln's tools.NormalizeReference: parse the
+// input via go-containerregistry's name package and return its canonical
+// Name(). For fully-qualified Harbor inputs this is a no-op; for shortnames
+// it expands to the canonical docker.io form. If parsing fails we return the
+// input unchanged so we never break a working slug computation.
+func normalizeImageRef(ref string) string {
+	parsed, err := name.ParseReference(ref)
+	if err != nil {
+		return ref
+	}
+	return parsed.Name()
 }
 
 // ImageSlugForRequest generates the VulnerabilityManifest CRD name for a Harbor scan request.
