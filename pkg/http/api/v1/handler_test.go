@@ -3,6 +3,7 @@ package v1
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -236,5 +237,74 @@ func TestHealthProbes(t *testing.T) {
 				t.Errorf("expected 200 for %s, got %d", tc.path, w.Code)
 			}
 		})
+	}
+}
+
+// TestReady_FailingCheck pins issue #16: when a registered readiness check
+// returns an error the probe must respond 503 so Kubernetes routes traffic
+// away from the pod, rather than 200 (which would let Harbor keep hitting
+// a pod that can only emit 500s).
+func TestReady_FailingCheck(t *testing.T) {
+	handler := NewAPIHandler(
+		config.BuildInfo{}, config.Config{}, memory.NewStore(), nil,
+		ReadinessCheck{
+			Name:  "kubernetes-client",
+			Check: func() error { return fmt.Errorf("k8s client unavailable") },
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/probe/ready", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		OK     bool `json:"ok"`
+		Checks []struct {
+			Name  string `json:"name"`
+			OK    bool   `json:"ok"`
+			Error string `json:"error,omitempty"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.OK {
+		t.Errorf("expected ok=false in body, got ok=true")
+	}
+	if len(body.Checks) != 1 || body.Checks[0].Name != "kubernetes-client" || body.Checks[0].OK {
+		t.Errorf("expected one failing kubernetes-client check, got %+v", body.Checks)
+	}
+	if body.Checks[0].Error != "k8s client unavailable" {
+		t.Errorf("expected error message in body, got %q", body.Checks[0].Error)
+	}
+
+	// Liveness must still be 200 — the process is up, it just can't serve.
+	req = httptest.NewRequest(http.MethodGet, "/probe/healthy", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/probe/healthy must stay 200 even when not ready, got %d", w.Code)
+	}
+}
+
+// TestReady_AllChecksPass confirms the all-pass path returns 200 and lists
+// each successful check by name.
+func TestReady_AllChecksPass(t *testing.T) {
+	handler := NewAPIHandler(
+		config.BuildInfo{}, config.Config{}, memory.NewStore(), nil,
+		ReadinessCheck{Name: "first", Check: func() error { return nil }},
+		ReadinessCheck{Name: "second", Check: func() error { return nil }},
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/probe/ready", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
