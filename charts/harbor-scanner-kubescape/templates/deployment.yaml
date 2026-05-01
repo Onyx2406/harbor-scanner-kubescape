@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.acknowledgeUnsafeMultiReplica) -}}
+{{- fail "replicaCount > 1 is not safe: scan state is held in-memory and is not shared across pods, causing Harbor polls to 404 on jobs accepted by other replicas. Set acknowledgeUnsafeMultiReplica=true to override (and accept the broken behavior), or keep replicaCount: 1. See https://github.com/goharbor/harbor-scanner-kubescape/issues/2." -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

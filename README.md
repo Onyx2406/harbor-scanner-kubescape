@@ -79,6 +79,15 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
   --set service.port=8443
 ```
 
+### Replicas
+
+Scan state is held in an in-memory store, so the chart only supports
+`replicaCount: 1`. Installing with a higher replica count is rejected by a
+chart-level validation; you can opt out via `--set acknowledgeUnsafeMultiReplica=true`
+but Harbor polls will return 404 for jobs that landed on a different replica.
+See [#2](https://github.com/goharbor/harbor-scanner-kubescape/issues/2) for the
+shared-backend plan.
+
 ## Development
 
 ### Build

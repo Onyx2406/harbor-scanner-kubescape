@@ -1,5 +1,5 @@
 # Binaries
-harbor-scanner-kubescape
+/harbor-scanner-kubescape
 *.exe
 *.exe~
 *.dll

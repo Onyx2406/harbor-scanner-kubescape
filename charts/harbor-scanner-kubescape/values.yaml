@@ -1,5 +1,13 @@
 replicaCount: 1
 
+# Scan state is held in an in-memory store and is not shared across pods, so
+# Harbor's polling requests can land on a replica that has no record of the
+# job and return 404. The chart fails installation if replicaCount > 1 unless
+# this flag is set to true, in which case you accept the broken-by-design
+# behavior. Track https://github.com/goharbor/harbor-scanner-kubescape/issues/2
+# for the shared-backend (Redis/etc.) plan.
+acknowledgeUnsafeMultiReplica: false
+
 image:
   repository: ghcr.io/goharbor/harbor-scanner-kubescape
   tag: ""  # Defaults to Chart appVersion

@@ -10,7 +10,13 @@ import (
 )
 
 // Store is an in-memory implementation of persistence.Store.
-// Suitable for single-instance deployments. For HA, replace with Redis.
+//
+// Single-instance only. Scan state is not shared across pods, so any
+// multi-replica deployment will return 404 on Harbor poll requests that land
+// on a replica different from the one that accepted the scan. The Helm chart
+// fails installation when replicaCount > 1 unless explicitly overridden — see
+// https://github.com/goharbor/harbor-scanner-kubescape/issues/2 for the
+// shared-backend (Redis/etc.) plan.
 type Store struct {
 	mu   sync.RWMutex
 	jobs map[string]*persistence.ScanJob
