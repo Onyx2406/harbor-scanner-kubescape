@@ -7,18 +7,17 @@ import (
 	"time"
 )
 
-// VulnerabilityManifest represents the relevant fields from the
-// kubescape/storage VulnerabilityManifest CRD.
-// We use our own struct to avoid pulling in the full kubescape/storage
-// dependency tree in early development. Once we stabilize, we can
-// switch to the generated types from kubescape/storage.
+// VulnerabilityManifest is a transformer-friendly projection of the
+// kubescape/storage v1beta1.VulnerabilityManifest CRD. The REST client
+// decodes the API response into the canonical type and then converts it
+// here, so any schema drift in the upstream type fails to compile in the
+// converter rather than silently zeroing out a field. See issue #3.
 type VulnerabilityManifest struct {
 	Name        string
 	Namespace   string
 	CreatedAt   time.Time
 	ToolName    string
 	ToolVersion string
-	DBVersion   string
 	Matches     []VulnMatch
 }
 

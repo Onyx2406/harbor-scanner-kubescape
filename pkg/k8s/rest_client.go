@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -12,12 +13,23 @@ import (
 	neturl "net/url"
 	"os"
 	"time"
+
+	v1beta1 "github.com/kubescape/storage/pkg/apis/softwarecomposition/v1beta1"
 )
 
 // RESTClient implements Client by calling the Kubernetes API directly via REST.
-// This avoids pulling in client-go and kubescape/storage as compile-time dependencies
-// while still reading VulnerabilityManifest CRDs. For production use, replace with
-// the generated clientset from kubescape/storage.
+//
+// We deliberately avoid client-go to keep the binary lean. We do, however,
+// import the canonical v1beta1.VulnerabilityManifest types from
+// github.com/kubescape/storage and decode the API response into them. That
+// makes any schema drift between this adapter and kubescape — renamed
+// fields, type changes — a compile-time failure in the converter below
+// rather than silent data loss. See issue #3.
+//
+// CWE IDs are not (yet) part of the canonical v1beta1.VulnerabilityMetadata
+// schema in kubescape/storage, but kubevuln/Grype payloads do carry them.
+// We parse them out via a tiny overlay decode against the raw response
+// body. See issue #5.
 type RESTClient struct {
 	baseURL    string
 	httpClient *http.Client
@@ -63,73 +75,26 @@ const (
 	resource   = "vulnerabilitymanifests"
 )
 
-// crdResponse is the JSON structure of a VulnerabilityManifest CRD from the K8s API.
-type crdResponse struct {
-	Metadata struct {
-		Name              string            `json:"name"`
-		Namespace         string            `json:"namespace"`
-		CreationTimestamp string            `json:"creationTimestamp"`
-		Annotations       map[string]string `json:"annotations"`
-	} `json:"metadata"`
+// cweOverlay captures CWE-related fields the canonical v1beta1 type does not
+// (yet) carry. It is decoded from the same response body as the canonical
+// type and merged in by index, so when kubescape/storage adds Cwes to its
+// VulnerabilityMetadata we can drop this overlay in favor of the canonical
+// field with no behavior change.
+type cweOverlay struct {
 	Spec struct {
-		Metadata struct {
-			Tool struct {
-				Name            string `json:"name"`
-				Version         string `json:"version"`
-				DatabaseVersion string `json:"databaseVersion"`
-			} `json:"tool"`
-			Report struct {
-				CreatedAt string `json:"createdAt"`
-			} `json:"report"`
-		} `json:"metadata"`
 		Payload struct {
-			Matches []crdMatch `json:"matches"`
+			Matches []cweOverlayMatch `json:"matches"`
 		} `json:"payload"`
 	} `json:"spec"`
 }
 
-type crdCvss struct {
-	Version string `json:"version"`
-	Vector  string `json:"vector"`
-	Metrics struct {
-		BaseScore float64 `json:"baseScore"`
-	} `json:"metrics"`
-}
-
-type crdRelatedVulnerability struct {
-	ID         string   `json:"id"`
-	DataSource string   `json:"dataSource"`
-	Namespace  string   `json:"namespace"`
-	Cwes       []string `json:"cwes"`
-}
-
-type crdMatch struct {
+type cweOverlayMatch struct {
 	Vulnerability struct {
-		ID          string    `json:"id"`
-		DataSource  string    `json:"dataSource"`
-		Severity    string    `json:"severity"`
-		URLs        []string  `json:"urls"`
-		Description string    `json:"description"`
-		Cvss        []crdCvss `json:"cvss"`
-		Fix         struct {
-			Versions []string `json:"versions"`
-			State    string   `json:"state"`
-		} `json:"fix"`
-		// Some Grype vulnerabilities carry CWEs directly; most NVD-derived
-		// CWEs live on relatedVulnerabilities below. Both are captured.
 		Cwes []string `json:"cwes"`
 	} `json:"vulnerability"`
-	RelatedVulnerabilities []crdRelatedVulnerability `json:"relatedVulnerabilities"`
-	Artifact               struct {
-		Name     string `json:"name"`
-		Version  string `json:"version"`
-		Type     string `json:"type"`
-		Language string `json:"language"`
-	} `json:"artifact"`
-}
-
-type crdListResponse struct {
-	Items []crdResponse `json:"items"`
+	RelatedVulnerabilities []struct {
+		Cwes []string `json:"cwes"`
+	} `json:"relatedVulnerabilities"`
 }
 
 func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, name string) (*VulnerabilityManifest, error) {
@@ -157,12 +122,19 @@ func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, na
 		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var crd crdResponse
-	if err := json.NewDecoder(resp.Body).Decode(&crd); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading VulnerabilityManifest: %w", err)
+	}
+
+	var crd v1beta1.VulnerabilityManifest
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&crd); err != nil {
 		return nil, fmt.Errorf("decoding VulnerabilityManifest: %w", err)
 	}
 
-	return crdToManifest(crd), nil
+	vm := canonicalToManifest(&crd)
+	applyCweOverlay(body, vm)
+	return vm, nil
 }
 
 func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, labelSelector string) ([]VulnerabilityManifest, error) {
@@ -190,66 +162,91 @@ func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, 
 		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var list crdListResponse
+	var list v1beta1.VulnerabilityManifestList
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil, fmt.Errorf("decoding VulnerabilityManifest list: %w", err)
 	}
 
-	var result []VulnerabilityManifest
-	for _, item := range list.Items {
-		result = append(result, *crdToManifest(item))
+	result := make([]VulnerabilityManifest, 0, len(list.Items))
+	for i := range list.Items {
+		result = append(result, *canonicalToManifest(&list.Items[i]))
 	}
 	return result, nil
 }
 
-func crdToManifest(crd crdResponse) *VulnerabilityManifest {
-	createdAt, err := time.Parse(time.RFC3339, crd.Metadata.CreationTimestamp)
-	if err != nil {
-		slog.Warn("Failed to parse createdAt", "err", err)
+// canonicalToManifest converts the kubescape/storage v1beta1 type into the
+// internal shape the transformer consumes. This is the choke point for
+// schema drift: any rename or type change in v1beta1 fields we read here
+// will fail the compile, not silently zero out a field.
+func canonicalToManifest(crd *v1beta1.VulnerabilityManifest) *VulnerabilityManifest {
+	createdAt := crd.CreationTimestamp.Time
+	if reportTime := crd.Spec.Metadata.Report.CreatedAt.Time; !reportTime.IsZero() {
+		createdAt = reportTime
 	}
 
 	vm := &VulnerabilityManifest{
-		Name:        crd.Metadata.Name,
-		Namespace:   crd.Metadata.Namespace,
+		Name:        crd.Name,
+		Namespace:   crd.Namespace,
 		CreatedAt:   createdAt,
 		ToolName:    crd.Spec.Metadata.Tool.Name,
 		ToolVersion: crd.Spec.Metadata.Tool.Version,
-		DBVersion:   crd.Spec.Metadata.Tool.DatabaseVersion,
 	}
 
-	for _, m := range crd.Spec.Payload.Matches {
-		match := VulnMatch{
-			ID:          m.Vulnerability.ID,
-			Severity:    m.Vulnerability.Severity,
-			Description: m.Vulnerability.Description,
-			DataSource:  m.Vulnerability.DataSource,
-			URLs:        m.Vulnerability.URLs,
-			FixVersions: m.Vulnerability.Fix.Versions,
-			FixState:    m.Vulnerability.Fix.State,
-			PkgName:     m.Artifact.Name,
-			PkgVersion:  m.Artifact.Version,
-			PkgType:     m.Artifact.Type,
-			PkgLanguage: m.Artifact.Language,
-			CweIDs:      collectCweIDs(m),
-		}
-		for _, c := range m.Vulnerability.Cvss {
-			match.CVSS = append(match.CVSS, VulnCVSS{
-				Version:   c.Version,
-				Vector:    c.Vector,
-				BaseScore: c.Metrics.BaseScore,
-			})
-		}
-		vm.Matches = append(vm.Matches, match)
+	for i := range crd.Spec.Payload.Matches {
+		vm.Matches = append(vm.Matches, canonicalMatchToVulnMatch(&crd.Spec.Payload.Matches[i]))
 	}
-
 	return vm
 }
 
-// collectCweIDs returns the union (preserving first-seen order) of CWE IDs on
+func canonicalMatchToVulnMatch(m *v1beta1.Match) VulnMatch {
+	match := VulnMatch{
+		ID:          m.Vulnerability.ID,
+		Severity:    m.Vulnerability.Severity,
+		Description: m.Vulnerability.Description,
+		DataSource:  m.Vulnerability.DataSource,
+		URLs:        m.Vulnerability.URLs,
+		FixVersions: m.Vulnerability.Fix.Versions,
+		FixState:    m.Vulnerability.Fix.State,
+		PkgName:     m.Artifact.Name,
+		PkgVersion:  m.Artifact.Version,
+		PkgType:     string(m.Artifact.Type),
+		PkgLanguage: string(m.Artifact.Language),
+	}
+	for _, c := range m.Vulnerability.Cvss {
+		match.CVSS = append(match.CVSS, VulnCVSS{
+			Version:   c.Version,
+			Vector:    c.Vector,
+			BaseScore: c.Metrics.BaseScore,
+		})
+	}
+	return match
+}
+
+// applyCweOverlay decodes CWE arrays from the raw response body and merges
+// them onto vm.Matches by index. Failure to decode is non-fatal — the
+// canonical fields are already populated and CWEs are an enrichment.
+func applyCweOverlay(body []byte, vm *VulnerabilityManifest) {
+	if vm == nil {
+		return
+	}
+	var overlay cweOverlay
+	if err := json.Unmarshal(body, &overlay); err != nil {
+		return
+	}
+	n := len(overlay.Spec.Payload.Matches)
+	if n > len(vm.Matches) {
+		n = len(vm.Matches)
+	}
+	for i := 0; i < n; i++ {
+		vm.Matches[i].CweIDs = unionCwes(overlay.Spec.Payload.Matches[i])
+	}
+}
+
+// unionCwes returns the deduplicated union (first-seen order) of CWE IDs on
 // the matched vulnerability and on each related vulnerability. Returns nil
 // when no CWEs are present so the harbor.VulnerabilityItem.CweIDs JSON tag
 // (omitempty) drops the field cleanly.
-func collectCweIDs(m crdMatch) []string {
+func unionCwes(m cweOverlayMatch) []string {
 	seen := make(map[string]struct{})
 	var out []string
 

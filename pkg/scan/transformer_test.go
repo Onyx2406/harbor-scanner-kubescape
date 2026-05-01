@@ -14,7 +14,6 @@ func TestTransformManifestToReport(t *testing.T) {
 		CreatedAt:   time.Date(2025, 1, 15, 10, 0, 0, 0, time.UTC),
 		ToolName:    "grype",
 		ToolVersion: "0.74.0",
-		DBVersion:   "v6-2025-01-15",
 		Matches: []k8s.VulnMatch{
 			{
 				ID:          "CVE-2024-1234",
