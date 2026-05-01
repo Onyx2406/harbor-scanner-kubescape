@@ -14,9 +14,10 @@ type BuildInfo struct {
 
 // Config holds all configuration for the scanner adapter.
 type Config struct {
-	API      APIConfig
-	Kubevuln KubevulnConfig
-	Scan     ScanConfig
+	API         APIConfig
+	Kubevuln    KubevulnConfig
+	Scan        ScanConfig
+	Persistence PersistenceConfig
 }
 
 // ScanConfig holds policy knobs for the scan controller.
@@ -25,6 +26,17 @@ type ScanConfig struct {
 	// CRD. Anything older triggers a fresh scan so newly disclosed CVEs in
 	// the Grype DB get picked up. Zero disables reuse outright. See issue #14.
 	ReuseTTL time.Duration
+}
+
+// PersistenceConfig holds knobs for the in-memory persistence store. See
+// pkg/persistence/memory for behavior details. Issue #17.
+type PersistenceConfig struct {
+	// MemoryRetention is how long a Finished/Failed job is kept in memory
+	// before the janitor evicts it. Long enough to outlast Harbor's poll
+	// loop; short enough to bound memory.
+	MemoryRetention time.Duration
+	// MemoryCleanupInterval is how often the janitor runs.
+	MemoryCleanupInterval time.Duration
 }
 
 // APIConfig holds HTTP server configuration.
@@ -70,6 +82,10 @@ func Load() (Config, error) {
 		Scan: ScanConfig{
 			ReuseTTL: durationFromEnv("SCAN_REUSE_TTL", 24*time.Hour),
 		},
+		Persistence: PersistenceConfig{
+			MemoryRetention:       durationFromEnv("MEMORY_STORE_RETENTION", 1*time.Hour),
+			MemoryCleanupInterval: durationFromEnv("MEMORY_STORE_CLEANUP_INTERVAL", 5*time.Minute),
+		},
 	}
 
 	return cfg, nil
@@ -77,7 +93,7 @@ func Load() (Config, error) {
 
 // durationFromEnv reads a Go duration from the named env var, falling back to
 // the provided default if unset or unparseable. Examples: "1h", "30m", "0s".
-// "0" or any non-positive duration disables the relevant feature.
+// A non-positive duration disables the relevant feature.
 func durationFromEnv(key string, defaultValue time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {

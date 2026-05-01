@@ -54,7 +54,16 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		slog.String("commit", buildInfo.Commit),
 	)
 
-	store := memory.NewStore()
+	store := memory.NewStore(
+		memory.WithRetention(cfg.Persistence.MemoryRetention),
+		memory.WithCleanupInterval(cfg.Persistence.MemoryCleanupInterval),
+	)
+	defer store.Close()
+	slog.Info("Memory store configured",
+		slog.Duration("retention", cfg.Persistence.MemoryRetention),
+		slog.Duration("cleanup_interval", cfg.Persistence.MemoryCleanupInterval),
+	)
+
 	scanner := scan.NewScanner(cfg.Kubevuln)
 
 	// Initialize K8s client for VulnerabilityManifest CRD access.
