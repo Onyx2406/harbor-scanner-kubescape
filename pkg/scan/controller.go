@@ -16,10 +16,17 @@ const (
 	pollInterval = 5 * time.Second
 	// Maximum time to wait for a scan to complete.
 	pollTimeout = 10 * time.Minute
+	// DefaultReuseTTL is the default freshness window for reusing an existing
+	// VulnerabilityManifest. Anything older triggers a fresh scan so newly
+	// disclosed CVEs in the Grype DB get picked up. See issue #14.
+	DefaultReuseTTL = 24 * time.Hour
 )
 
+// now is overridable in tests. Production always uses time.Now.
+var now = time.Now
+
 // Controller orchestrates the scanning workflow:
-// 1. Check if VulnerabilityManifest CRD already exists for the image
+// 1. Check if a fresh VulnerabilityManifest CRD already exists for the image
 // 2. If yes, transform and return it
 // 3. If no, trigger kubevuln ScanCVE, then poll for the CRD
 type Controller interface {
@@ -31,15 +38,22 @@ type controller struct {
 	scanner   Scanner
 	k8sClient k8s.Client
 	namespace string
+	reuseTTL  time.Duration
 }
 
 // NewController creates a new scan controller.
-func NewController(store persistence.Store, scanner Scanner, k8sClient k8s.Client, namespace string) Controller {
+//
+// reuseTTL is the freshness window for an existing VulnerabilityManifest CRD;
+// anything older is treated as stale and triggers a fresh scan. Pass 0 to
+// disable reuse entirely (always rescan), or use DefaultReuseTTL for the
+// recommended default.
+func NewController(store persistence.Store, scanner Scanner, k8sClient k8s.Client, namespace string, reuseTTL time.Duration) Controller {
 	return &controller{
 		store:     store,
 		scanner:   scanner,
 		k8sClient: k8sClient,
 		namespace: namespace,
+		reuseTTL:  reuseTTL,
 	}
 }
 
@@ -94,22 +108,36 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		slog.String("namespace", c.namespace),
 	)
 
-	// Step 1: Check if VulnerabilityManifest already exists
+	// Step 1: Check if a fresh VulnerabilityManifest already exists. The
+	// freshness check is uniform: a CRD is reusable iff it is younger than
+	// reuseTTL, regardless of whether it carries zero or many matches. The
+	// previous len(Matches) > 0 gate caused two bugs: clean images were
+	// rescanned every time, and vulnerable manifests were reused forever
+	// even after the Grype DB or scanner version changed (issue #14).
 	existing, err := c.k8sClient.GetVulnerabilityManifest(ctx, c.namespace, crdName)
 	if err != nil {
 		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
 			slog.String("err", err.Error()),
 		)
-	} else if existing != nil && len(existing.Matches) > 0 {
-		slog.Info("Found existing VulnerabilityManifest, reusing results",
+	} else if existing != nil && c.canReuse(existing) {
+		slog.Info("Found fresh VulnerabilityManifest, reusing results",
 			slog.String("crd_name", crdName),
 			slog.Int("matches", len(existing.Matches)),
+			slog.Time("created_at", existing.CreatedAt),
+			slog.Duration("ttl", c.reuseTTL),
 		)
 		report := TransformManifestToReport(existing, job.Request.Artifact)
 		if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
 			return err
 		}
 		return c.store.UpdateStatus(ctx, scanJobID, persistence.Finished)
+	} else if existing != nil {
+		slog.Info("Existing VulnerabilityManifest is stale, triggering fresh scan",
+			slog.String("crd_name", crdName),
+			slog.Time("created_at", existing.CreatedAt),
+			slog.Duration("age", now().Sub(existing.CreatedAt)),
+			slog.Duration("ttl", c.reuseTTL),
+		)
 	}
 
 	// Step 2: No existing CRD — trigger kubevuln scan
@@ -136,6 +164,20 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 
 	slog.Info("Scan completed", slog.String("scan_job_id", scanJobID))
 	return nil
+}
+
+// canReuse reports whether an existing VulnerabilityManifest is fresh enough
+// to skip a fresh scan. A zero reuseTTL disables reuse outright. A zero or
+// missing CreatedAt is treated as stale — we will not reuse a manifest of
+// unknown age, since we can't tell whether it predates the current Grype DB.
+func (c *controller) canReuse(vm *k8s.VulnerabilityManifest) bool {
+	if c.reuseTTL <= 0 {
+		return false
+	}
+	if vm.CreatedAt.IsZero() {
+		return false
+	}
+	return now().Sub(vm.CreatedAt) < c.reuseTTL
 }
 
 // pollForResults polls the Kubernetes API for the VulnerabilityManifest CRD

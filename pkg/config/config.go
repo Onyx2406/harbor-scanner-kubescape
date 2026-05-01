@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"time"
 )
 
 // BuildInfo holds version information set at build time.
@@ -15,6 +16,15 @@ type BuildInfo struct {
 type Config struct {
 	API      APIConfig
 	Kubevuln KubevulnConfig
+	Scan     ScanConfig
+}
+
+// ScanConfig holds policy knobs for the scan controller.
+type ScanConfig struct {
+	// ReuseTTL is the freshness window for an existing VulnerabilityManifest
+	// CRD. Anything older triggers a fresh scan so newly disclosed CVEs in
+	// the Grype DB get picked up. Zero disables reuse outright. See issue #14.
+	ReuseTTL time.Duration
 }
 
 // APIConfig holds HTTP server configuration.
@@ -57,9 +67,27 @@ func Load() (Config, error) {
 			URL:       envOrDefault("KUBEVULN_URL", "http://kubevuln:8080"),
 			Namespace: envOrDefault("KUBEVULN_NAMESPACE", "kubescape"),
 		},
+		Scan: ScanConfig{
+			ReuseTTL: durationFromEnv("SCAN_REUSE_TTL", 24*time.Hour),
+		},
 	}
 
 	return cfg, nil
+}
+
+// durationFromEnv reads a Go duration from the named env var, falling back to
+// the provided default if unset or unparseable. Examples: "1h", "30m", "0s".
+// "0" or any non-positive duration disables the relevant feature.
+func durationFromEnv(key string, defaultValue time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultValue
+	}
+	return d
 }
 
 func envOrDefault(key, defaultValue string) string {
