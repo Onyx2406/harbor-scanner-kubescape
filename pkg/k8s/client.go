@@ -36,6 +36,12 @@ type VulnMatch struct {
 	PkgType     string
 	PkgLanguage string
 	CVSS        []VulnCVSS
+	// CweIDs is the deduplicated list of CWE identifiers associated with this
+	// match. Sourced from the top-level vulnerability and any related
+	// vulnerabilities in the Grype payload (NVD-derived CWEs typically appear
+	// on the relatedVulnerabilities entry rather than on the matched
+	// vulnerability itself).
+	CweIDs []string
 }
 
 // VulnCVSS holds CVSS data from a vulnerability match.

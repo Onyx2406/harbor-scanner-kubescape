@@ -25,6 +25,7 @@ func TestTransformManifestToReport(t *testing.T) {
 				FixState:    "fixed",
 				PkgName:     "libfoo",
 				PkgVersion:  "1.2.3",
+				CweIDs:      []string{"CWE-79", "CWE-89"},
 				CVSS: []k8s.VulnCVSS{
 					{Version: "3.1", Vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", BaseScore: 9.8},
 				},
@@ -87,6 +88,14 @@ func TestTransformManifestToReport(t *testing.T) {
 	if v1.CVSS.ScoreV3 == nil || *v1.CVSS.ScoreV3 != 9.8 {
 		t.Errorf("expected CVSS v3 score 9.8, got %v", v1.CVSS.ScoreV3)
 	}
+	if got, want := v1.CweIDs, []string{"CWE-79", "CWE-89"}; !equalStrings(got, want) {
+		t.Errorf("expected CweIDs %v, got %v", want, got)
+	}
+
+	// Second vulnerability has no CWEs — confirm we don't accidentally invent some.
+	if len(report.Vulnerabilities[1].CweIDs) != 0 {
+		t.Errorf("expected no CweIDs on v2, got %v", report.Vulnerabilities[1].CweIDs)
+	}
 
 	// Check second vulnerability
 	v2 := report.Vulnerabilities[1]
@@ -122,6 +131,18 @@ func TestTransformManifestToReport_Empty(t *testing.T) {
 	if report.Vulnerabilities == nil {
 		t.Error("expected non-nil vulnerabilities slice for JSON serialization")
 	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestMapSeverity(t *testing.T) {
