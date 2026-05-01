@@ -88,26 +88,39 @@ type crdResponse struct {
 	} `json:"spec"`
 }
 
+type crdCvss struct {
+	Version string `json:"version"`
+	Vector  string `json:"vector"`
+	Metrics struct {
+		BaseScore float64 `json:"baseScore"`
+	} `json:"metrics"`
+}
+
+type crdRelatedVulnerability struct {
+	ID         string   `json:"id"`
+	DataSource string   `json:"dataSource"`
+	Namespace  string   `json:"namespace"`
+	Cwes       []string `json:"cwes"`
+}
+
 type crdMatch struct {
 	Vulnerability struct {
-		ID          string   `json:"id"`
-		DataSource  string   `json:"dataSource"`
-		Severity    string   `json:"severity"`
-		URLs        []string `json:"urls"`
-		Description string   `json:"description"`
-		Cvss        []struct {
-			Version string `json:"version"`
-			Vector  string `json:"vector"`
-			Metrics struct {
-				BaseScore float64 `json:"baseScore"`
-			} `json:"metrics"`
-		} `json:"cvss"`
-		Fix struct {
+		ID          string    `json:"id"`
+		DataSource  string    `json:"dataSource"`
+		Severity    string    `json:"severity"`
+		URLs        []string  `json:"urls"`
+		Description string    `json:"description"`
+		Cvss        []crdCvss `json:"cvss"`
+		Fix         struct {
 			Versions []string `json:"versions"`
 			State    string   `json:"state"`
 		} `json:"fix"`
+		// Some Grype vulnerabilities carry CWEs directly; most NVD-derived
+		// CWEs live on relatedVulnerabilities below. Both are captured.
+		Cwes []string `json:"cwes"`
 	} `json:"vulnerability"`
-	Artifact struct {
+	RelatedVulnerabilities []crdRelatedVulnerability `json:"relatedVulnerabilities"`
+	Artifact               struct {
 		Name     string `json:"name"`
 		Version  string `json:"version"`
 		Type     string `json:"type"`
@@ -217,6 +230,7 @@ func crdToManifest(crd crdResponse) *VulnerabilityManifest {
 			PkgVersion:  m.Artifact.Version,
 			PkgType:     m.Artifact.Type,
 			PkgLanguage: m.Artifact.Language,
+			CweIDs:      collectCweIDs(m),
 		}
 		for _, c := range m.Vulnerability.Cvss {
 			match.CVSS = append(match.CVSS, VulnCVSS{
@@ -229,4 +243,32 @@ func crdToManifest(crd crdResponse) *VulnerabilityManifest {
 	}
 
 	return vm
+}
+
+// collectCweIDs returns the union (preserving first-seen order) of CWE IDs on
+// the matched vulnerability and on each related vulnerability. Returns nil
+// when no CWEs are present so the harbor.VulnerabilityItem.CweIDs JSON tag
+// (omitempty) drops the field cleanly.
+func collectCweIDs(m crdMatch) []string {
+	seen := make(map[string]struct{})
+	var out []string
+
+	add := func(ids []string) {
+		for _, id := range ids {
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+
+	add(m.Vulnerability.Cwes)
+	for _, rv := range m.RelatedVulnerabilities {
+		add(rv.Cwes)
+	}
+	return out
 }

@@ -40,6 +40,7 @@ func TransformManifestToReport(vm *k8s.VulnerabilityManifest, artifact harbor.Ar
 			Severity:    sev,
 			Description: m.Description,
 			Links:       m.URLs,
+			CweIDs:      m.CweIDs,
 		}
 
 		// Map CVSS if available
