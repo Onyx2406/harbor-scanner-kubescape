@@ -73,7 +73,10 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 			slog.String("api_server", baseURL),
 		)
 	} else {
-		slog.Warn("Not running in Kubernetes cluster, VulnerabilityManifest CRD lookup disabled")
+		slog.Warn("Not running in Kubernetes cluster — VulnerabilityManifest CRD lookup disabled. " +
+			"Scan requests will fail with HTTP 500 until k8s access is provided. " +
+			"This warning is expected for local dev; in production, ensure the pod has " +
+			"a service account with read access to vulnerabilitymanifests.spdx.softwarecomposition.kubescape.io.")
 	}
 
 	controller := scan.NewController(store, scanner, k8sClient, cfg.Kubevuln.Namespace)

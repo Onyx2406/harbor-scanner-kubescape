@@ -60,6 +60,14 @@ func (c *controller) Scan(ctx context.Context, scanJobID string) error {
 	return nil
 }
 
+// ErrK8sUnavailable is returned when the controller cannot read
+// VulnerabilityManifest CRDs from Kubernetes. The adapter cannot observe scan
+// results in this state, so propagating an error is the correct behavior —
+// returning a placeholder zero-vulnerability report would be a security-
+// relevant false negative (Harbor would mark images clean that were never
+// scanned). See issue #6.
+var ErrK8sUnavailable = fmt.Errorf("kubernetes client unavailable: cannot observe VulnerabilityManifest CRDs")
+
 func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	job, err := c.store.Get(ctx, scanJobID)
 	if err != nil {
@@ -67,6 +75,10 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	}
 	if job == nil {
 		return fmt.Errorf("scan job not found: %s", scanJobID)
+	}
+
+	if c.k8sClient == nil {
+		return ErrK8sUnavailable
 	}
 
 	if err := c.store.UpdateStatus(ctx, scanJobID, persistence.Pending); err != nil {
@@ -83,23 +95,21 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	)
 
 	// Step 1: Check if VulnerabilityManifest already exists
-	if c.k8sClient != nil {
-		existing, err := c.k8sClient.GetVulnerabilityManifest(ctx, c.namespace, crdName)
-		if err != nil {
-			slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
-				slog.String("err", err.Error()),
-			)
-		} else if existing != nil && len(existing.Matches) > 0 {
-			slog.Info("Found existing VulnerabilityManifest, reusing results",
-				slog.String("crd_name", crdName),
-				slog.Int("matches", len(existing.Matches)),
-			)
-			report := TransformManifestToReport(existing, job.Request.Artifact)
-			if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
-				return err
-			}
-			return c.store.UpdateStatus(ctx, scanJobID, persistence.Finished)
+	existing, err := c.k8sClient.GetVulnerabilityManifest(ctx, c.namespace, crdName)
+	if err != nil {
+		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
+			slog.String("err", err.Error()),
+		)
+	} else if existing != nil && len(existing.Matches) > 0 {
+		slog.Info("Found existing VulnerabilityManifest, reusing results",
+			slog.String("crd_name", crdName),
+			slog.Int("matches", len(existing.Matches)),
+		)
+		report := TransformManifestToReport(existing, job.Request.Artifact)
+		if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
+			return err
 		}
+		return c.store.UpdateStatus(ctx, scanJobID, persistence.Finished)
 	}
 
 	// Step 2: No existing CRD — trigger kubevuln scan
@@ -112,20 +122,12 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	}
 
 	// Step 3: Poll for VulnerabilityManifest CRD
-	if c.k8sClient != nil {
-		report, err := c.pollForResults(ctx, crdName, job.Request.Artifact)
-		if err != nil {
-			return fmt.Errorf("waiting for scan results: %w", err)
-		}
-		if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
-			return err
-		}
-	} else {
-		// No K8s client available (e.g., local dev) — store a placeholder
-		report := BuildPlaceholderReport(job.Request.Artifact)
-		if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
-			return err
-		}
+	report, err := c.pollForResults(ctx, crdName, job.Request.Artifact)
+	if err != nil {
+		return fmt.Errorf("waiting for scan results: %w", err)
+	}
+	if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
+		return err
 	}
 
 	if err := c.store.UpdateStatus(ctx, scanJobID, persistence.Finished); err != nil {

@@ -2,7 +2,6 @@ package scan
 
 import (
 	"strings"
-	"time"
 
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/k8s"
@@ -69,21 +68,6 @@ func TransformManifestToReport(vm *k8s.VulnerabilityManifest, artifact harbor.Ar
 	}
 
 	return report
-}
-
-// BuildPlaceholderReport creates a minimal report for when kubevuln has been triggered
-// but VulnerabilityManifest CRD is not yet available.
-func BuildPlaceholderReport(artifact harbor.Artifact) harbor.ScanReport {
-	return harbor.ScanReport{
-		GeneratedAt: time.Now().UTC(),
-		Artifact:    artifact,
-		Scanner: harbor.Scanner{
-			Name:    "Kubescape",
-			Vendor:  "ARMO",
-			Version: "v3.0.0",
-		},
-		Vulnerabilities: []harbor.VulnerabilityItem{},
-	}
 }
 
 var severityMap = map[string]harbor.Severity{
