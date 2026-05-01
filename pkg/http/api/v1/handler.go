@@ -29,20 +29,42 @@ const (
 	mimeTypeDockerManifest = "application/vnd.docker.distribution.manifest.v2+json"
 )
 
+// ReadinessCheck returns nil when the named subsystem is ready to serve scan
+// traffic, or an error describing why it is not. Composed in NewAPIHandler so
+// future dependencies (durable store, kubevuln reachability) can layer in
+// without touching the probe handler. See issue #16.
+type ReadinessCheck struct {
+	Name  string
+	Check func() error
+}
+
 type requestHandler struct {
-	buildInfo  config.BuildInfo
-	config     config.Config
-	store      persistence.Store
-	controller scan.Controller
+	buildInfo       config.BuildInfo
+	config          config.Config
+	store           persistence.Store
+	controller      scan.Controller
+	readinessChecks []ReadinessCheck
 }
 
 // NewAPIHandler creates the HTTP handler with all Harbor Scanner API routes.
-func NewAPIHandler(buildInfo config.BuildInfo, cfg config.Config, store persistence.Store, controller scan.Controller) http.Handler {
+//
+// readinessChecks are evaluated on every /probe/ready hit. If any check
+// returns an error the probe responds 503 with a JSON listing the failing
+// subsystems, otherwise 200. /probe/healthy stays 200 unconditionally —
+// liveness reflects the process being up, not its ability to serve.
+func NewAPIHandler(
+	buildInfo config.BuildInfo,
+	cfg config.Config,
+	store persistence.Store,
+	controller scan.Controller,
+	readinessChecks ...ReadinessCheck,
+) http.Handler {
 	h := &requestHandler{
-		buildInfo:  buildInfo,
-		config:     cfg,
-		store:      store,
-		controller: controller,
+		buildInfo:       buildInfo,
+		config:          cfg,
+		store:           store,
+		controller:      controller,
+		readinessChecks: readinessChecks,
 	}
 
 	router := mux.NewRouter()
@@ -208,7 +230,43 @@ func (h *requestHandler) GetHealthy(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *requestHandler) GetReady(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
+	type checkResult struct {
+		Name  string `json:"name"`
+		Error string `json:"error,omitempty"`
+		OK    bool   `json:"ok"`
+	}
+
+	results := make([]checkResult, 0, len(h.readinessChecks))
+	allOK := true
+	for _, c := range h.readinessChecks {
+		err := c.Check()
+		results = append(results, checkResult{
+			Name:  c.Name,
+			OK:    err == nil,
+			Error: errString(err),
+		})
+		if err != nil {
+			allOK = false
+		}
+	}
+
+	if allOK {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "checks": results})
+		return
+	}
+
+	slog.Warn("Readiness check failed", slog.Any("checks", results))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "checks": results})
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func validateScanRequest(req harbor.ScanRequest) error {

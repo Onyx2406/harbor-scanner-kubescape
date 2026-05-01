@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -80,7 +81,24 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	}
 
 	controller := scan.NewController(store, scanner, k8sClient, cfg.Kubevuln.Namespace)
-	handler := v1.NewAPIHandler(buildInfo, cfg, store, controller)
+
+	// Readiness gates. The k8s-client check makes the pod NotReady when the
+	// adapter cannot observe VulnerabilityManifest CRDs, so Kubernetes won't
+	// route Harbor traffic to a pod that would only emit ErrK8sUnavailable.
+	// See issue #16.
+	readiness := []v1.ReadinessCheck{
+		{
+			Name: "kubernetes-client",
+			Check: func() error {
+				if k8sClient == nil {
+					return fmt.Errorf("kubernetes client unavailable; pod cannot read VulnerabilityManifest CRDs")
+				}
+				return nil
+			},
+		},
+	}
+
+	handler := v1.NewAPIHandler(buildInfo, cfg, store, controller, readiness...)
 
 	srv := &http.Server{
 		Addr:         cfg.API.Addr,
