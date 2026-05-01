@@ -58,8 +58,11 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
 | `KUBEVULN_URL` | `http://kubevuln:8080` | Base URL of the kubevuln service |
 | `KUBEVULN_NAMESPACE` | `kubescape` | Kubernetes namespace for Kubescape components |
 | `SCAN_REUSE_TTL` | `24h` | Freshness window for reusing an existing VulnerabilityManifest CRD. Older CRDs are treated as stale and trigger a fresh scan so newly disclosed CVEs are picked up. Set to `0` to disable reuse. |
-| `MEMORY_STORE_RETENTION` | `1h` | How long Finished/Failed scan jobs are kept in memory before eviction. Long enough to outlast Harbor's poll loop. Set to `0` to disable eviction (only sensible for tests). |
-| `MEMORY_STORE_CLEANUP_INTERVAL` | `5m` | How often the in-memory janitor runs. |
+| `PERSISTENCE_BACKEND` | `memory` | Backend for scan-job state. Set to `redis` for durable persistence across restart and multi-replica deployments. |
+| `MEMORY_STORE_RETENTION` | `1h` | (memory backend) How long Finished/Failed scan jobs are kept before eviction. Long enough to outlast Harbor's poll loop. Set to `0` to disable eviction (only sensible for tests). |
+| `MEMORY_STORE_CLEANUP_INTERVAL` | `5m` | (memory backend) How often the in-memory janitor runs. |
+| `REDIS_URL` | _(unset)_ | (redis backend) Redis connection URL. Example: `redis://:password@host:6379/0`. |
+| `REDIS_JOB_TTL` | `1h` | (redis backend) Per-key TTL. Each write resets it. Long enough to outlast Harbor's poll loop; short enough to bound storage. |
 
 ### TLS
 
@@ -82,14 +85,31 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
   --set service.port=8443
 ```
 
-### Replicas
+### Persistence and replicas
 
-Scan state is held in an in-memory store, so the chart only supports
-`replicaCount: 1`. Installing with a higher replica count is rejected by a
-chart-level validation; you can opt out via `--set acknowledgeUnsafeMultiReplica=true`
-but Harbor polls will return 404 for jobs that landed on a different replica.
-See [#2](https://github.com/goharbor/harbor-scanner-kubescape/issues/2) for the
-shared-backend plan.
+The adapter ships with two persistence backends:
+
+- **`memory`** (default) — in-process map. Single-pod, not durable across
+  restart, not shared across replicas. Fine for local dev. The chart
+  refuses to install with `replicaCount > 1` on this backend unless
+  `acknowledgeUnsafeMultiReplica=true` is set.
+
+- **`redis`** — Redis-backed Store. Scan state survives pod restart and is
+  shared across replicas, so `replicaCount > 1` works correctly. Recommended
+  for production. See [#15](https://github.com/goharbor/harbor-scanner-kubescape/issues/15).
+
+Helm install with Redis:
+
+```bash
+kubectl create secret generic harbor-scanner-redis \
+  --from-literal=url=redis://:secretpw@redis.harbor.svc.cluster.local:6379/0 -n harbor
+
+helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
+  --namespace harbor \
+  --set persistence.backend=redis \
+  --set persistence.redis.secretName=harbor-scanner-redis \
+  --set replicaCount=2
+```
 
 ## Development
 

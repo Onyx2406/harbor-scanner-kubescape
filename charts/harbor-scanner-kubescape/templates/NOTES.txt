@@ -1,20 +1,27 @@
 harbor-scanner-kubescape installed.
 
-{{- if gt (int .Values.replicaCount) 1 }}
+Persistence backend: {{ default "memory" .Values.persistence.backend }}
+{{- if eq (default "memory" .Values.persistence.backend) "memory" }}
 
-WARNING: replicaCount is {{ .Values.replicaCount }} but this release was installed with
-acknowledgeUnsafeMultiReplica=true. Scan state is held in an in-memory store
-(pkg/persistence/memory) and is not shared across pods. Harbor's polling
-requests will land on different replicas and return 404 for jobs accepted by
-another replica. Until a shared backend (e.g. Redis) is wired up, this is a
-known-broken configuration — do not use it in production.
+  In-memory store: state is per-pod, not durable across restart, and not
+  shared across replicas. Fine for local dev and single-replica
+  deployments where you tolerate losing in-flight scans on rollout.
 
+  For production, set:
+    persistence.backend: redis
+    persistence.redis.url: redis://your-redis:6379/0
 {{- else }}
 
-The adapter is running with replicaCount=1, the only currently supported
-configuration. See https://github.com/goharbor/harbor-scanner-kubescape/issues/2
-for the multi-replica plan.
+  Redis-backed store: scan state is durable across pod restarts and shared
+  across replicas. replicaCount > 1 is supported.
+{{- end }}
 
+{{- if and (gt (int .Values.replicaCount) 1) (eq (default "memory" .Values.persistence.backend) "memory") }}
+
+WARNING: replicaCount={{ .Values.replicaCount }} with the in-memory backend was
+allowed because acknowledgeUnsafeMultiReplica=true. Harbor poll requests will
+return 404 for any scan ID accepted by a different replica. This is a
+known-broken configuration; switch to the Redis backend for real HA.
 {{- end }}
 
 Register the scanner in Harbor:

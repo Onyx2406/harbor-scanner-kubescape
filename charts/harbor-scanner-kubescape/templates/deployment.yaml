@@ -1,5 +1,10 @@
-{{- if and (gt (int .Values.replicaCount) 1) (not .Values.acknowledgeUnsafeMultiReplica) -}}
-{{- fail "replicaCount > 1 is not safe: scan state is held in-memory and is not shared across pods, causing Harbor polls to 404 on jobs accepted by other replicas. Set acknowledgeUnsafeMultiReplica=true to override (and accept the broken behavior), or keep replicaCount: 1. See https://github.com/goharbor/harbor-scanner-kubescape/issues/2." -}}
+{{- $multiReplica := gt (int .Values.replicaCount) 1 -}}
+{{- $usingMemory := or (not .Values.persistence) (eq (default "memory" .Values.persistence.backend) "memory") -}}
+{{- if and $multiReplica $usingMemory (not .Values.acknowledgeUnsafeMultiReplica) -}}
+{{- fail "replicaCount > 1 is unsafe with persistence.backend=memory: scan state is per-pod and Harbor polls would 404 on jobs accepted by another replica. Set persistence.backend=redis (recommended) or acknowledgeUnsafeMultiReplica=true to override. See https://github.com/goharbor/harbor-scanner-kubescape/issues/2 and #15." -}}
+{{- end -}}
+{{- if and (eq (default "memory" .Values.persistence.backend) "redis") (not .Values.persistence.redis.url) (not .Values.persistence.redis.secretName) -}}
+{{- fail "persistence.backend=redis requires either persistence.redis.url or persistence.redis.secretName to be set." -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -33,6 +38,22 @@ spec:
               value: {{ .Values.scanner.kubevulnURL | quote }}
             - name: KUBEVULN_NAMESPACE
               value: {{ .Values.scanner.kubevulnNamespace | quote }}
+            - name: PERSISTENCE_BACKEND
+              value: {{ default "memory" .Values.persistence.backend | quote }}
+            {{- if eq (default "memory" .Values.persistence.backend) "redis" }}
+            {{- if .Values.persistence.redis.secretName }}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.persistence.redis.secretName }}
+                  key: url
+            {{- else }}
+            - name: REDIS_URL
+              value: {{ .Values.persistence.redis.url | quote }}
+            {{- end }}
+            - name: REDIS_JOB_TTL
+              value: {{ .Values.persistence.redis.ttl | quote }}
+            {{- end }}
             {{- if .Values.tls.enabled }}
             - name: SCANNER_API_TLS_CERT
               value: "/etc/harbor-scanner-kubescape/tls/tls.crt"
