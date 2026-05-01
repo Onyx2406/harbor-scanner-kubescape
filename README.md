@@ -44,16 +44,40 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
 2. Click **+ New Scanner**
 3. Fill in:
    - **Name**: Kubescape
-   - **Endpoint**: `http://harbor-scanner-kubescape.harbor.svc.cluster.local:8443`
+   - **Endpoint**: `http://harbor-scanner-kubescape.harbor.svc.cluster.local:8080`
+     (or `https://...:8443` if you enabled TLS — see [TLS](#tls) below)
 4. Click **Test Connection**, then **Add**
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `SCANNER_API_ADDR` | `:8443` | Address for the HTTP server to listen on |
+| `SCANNER_API_ADDR` | `:8080` | Address for the HTTP server to listen on |
+| `SCANNER_API_TLS_CERT` | _(unset)_ | Path to a PEM-encoded TLS certificate. When both cert and key are set, the server uses HTTPS. |
+| `SCANNER_API_TLS_KEY` | _(unset)_ | Path to the PEM-encoded TLS private key. |
 | `KUBEVULN_URL` | `http://kubevuln:8080` | Base URL of the kubevuln service |
 | `KUBEVULN_NAMESPACE` | `kubescape` | Kubernetes namespace for Kubescape components |
+
+### TLS
+
+By default the adapter serves plain HTTP on `:8080` and TLS termination is
+expected at the cluster edge (ingress / service mesh). To serve HTTPS directly,
+set both `SCANNER_API_TLS_CERT` and `SCANNER_API_TLS_KEY` to mounted PEM file
+paths and typically set `SCANNER_API_ADDR` to `:8443`.
+
+When deploying with the Helm chart, enable TLS via:
+
+```bash
+kubectl create secret tls harbor-scanner-kubescape-tls \
+  --cert=path/to/tls.crt --key=path/to/tls.key -n harbor
+
+helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
+  --namespace harbor \
+  --set tls.enabled=true \
+  --set tls.secretName=harbor-scanner-kubescape-tls \
+  --set scanner.apiAddr=":8443" \
+  --set service.port=8443
+```
 
 ## Development
 

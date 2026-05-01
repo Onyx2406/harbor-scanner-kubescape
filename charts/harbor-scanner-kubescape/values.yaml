@@ -10,16 +10,26 @@ fullnameOverride: ""
 
 service:
   type: ClusterIP
-  port: 8443
+  port: 8080
 
 # Scanner adapter configuration
 scanner:
-  # Address to listen on
-  apiAddr: ":8443"
+  # Address to listen on. Default is plain HTTP on :8080. If tls.enabled is
+  # true, set this to ":8443" (or your preferred TLS port).
+  apiAddr: ":8080"
   # Base URL of the kubevuln service in the cluster
   kubevulnURL: "http://kubevuln.kubescape.svc.cluster.local:8080"
   # Kubernetes namespace where Kubescape components run
   kubevulnNamespace: "kubescape"
+
+# TLS configuration. When enabled, the scanner serves HTTPS using the cert/key
+# from the referenced Secret (which must contain `tls.crt` and `tls.key` keys,
+# i.e. a kubernetes.io/tls Secret). When disabled, the scanner serves plain
+# HTTP and TLS termination is expected at the ingress / service mesh layer.
+tls:
+  enabled: false
+  # Name of an existing kubernetes.io/tls Secret in the same namespace.
+  secretName: ""
 
 resources:
   limits:
