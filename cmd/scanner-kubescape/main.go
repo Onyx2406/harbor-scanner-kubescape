@@ -80,7 +80,10 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 			"a service account with read access to vulnerabilitymanifests.spdx.softwarecomposition.kubescape.io.")
 	}
 
-	controller := scan.NewController(store, scanner, k8sClient, cfg.Kubevuln.Namespace)
+	slog.Info("Scan controller configured",
+		slog.Duration("reuse_ttl", cfg.Scan.ReuseTTL),
+	)
+	controller := scan.NewController(store, scanner, k8sClient, cfg.Kubevuln.Namespace, cfg.Scan.ReuseTTL)
 
 	// Readiness gates. The k8s-client check makes the pod NotReady when the
 	// adapter cannot observe VulnerabilityManifest CRDs, so Kubernetes won't

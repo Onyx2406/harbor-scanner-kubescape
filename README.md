@@ -57,6 +57,7 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
 | `SCANNER_API_TLS_KEY` | _(unset)_ | Path to the PEM-encoded TLS private key. |
 | `KUBEVULN_URL` | `http://kubevuln:8080` | Base URL of the kubevuln service |
 | `KUBEVULN_NAMESPACE` | `kubescape` | Kubernetes namespace for Kubescape components |
+| `SCAN_REUSE_TTL` | `24h` | Freshness window for reusing an existing VulnerabilityManifest CRD. Older CRDs are treated as stale and trigger a fresh scan so newly disclosed CVEs are picked up. Set to `0` to disable reuse. |
 
 ### TLS
 
