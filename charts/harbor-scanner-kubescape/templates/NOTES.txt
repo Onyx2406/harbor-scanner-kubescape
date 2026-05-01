@@ -19,6 +19,6 @@ for the multi-replica plan.
 
 Register the scanner in Harbor:
 
-  Endpoint: http://{{ include "harbor-scanner-kubescape.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+  Endpoint: {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}://{{ include "harbor-scanner-kubescape.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
 Then go to Harbor Admin -> Interrogation Services -> Scanners -> + New Scanner.
