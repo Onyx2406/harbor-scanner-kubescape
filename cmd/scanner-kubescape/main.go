@@ -13,8 +13,11 @@ import (
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/config"
 	v1 "github.com/goharbor/harbor-scanner-kubescape/pkg/http/api/v1"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/k8s"
+	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence/memory"
+	persistenceredis "github.com/goharbor/harbor-scanner-kubescape/pkg/persistence/redis"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/scan"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -54,15 +57,14 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		slog.String("commit", buildInfo.Commit),
 	)
 
-	store := memory.NewStore(
-		memory.WithRetention(cfg.Persistence.MemoryRetention),
-		memory.WithCleanupInterval(cfg.Persistence.MemoryCleanupInterval),
-	)
-	defer store.Close()
-	slog.Info("Memory store configured",
-		slog.Duration("retention", cfg.Persistence.MemoryRetention),
-		slog.Duration("cleanup_interval", cfg.Persistence.MemoryCleanupInterval),
-	)
+	store, storeCloser, err := buildStore(cfg.Persistence)
+	if err != nil {
+		return fmt.Errorf("initializing persistence backend: %w", err)
+	}
+	if storeCloser != nil {
+		defer storeCloser()
+	}
+	slog.Info("Persistence backend ready", slog.String("backend", string(cfg.Persistence.Backend)))
 
 	scanner := scan.NewScanner(cfg.Kubevuln)
 
@@ -155,4 +157,51 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 
 	<-shutdownComplete
 	return nil
+}
+
+// buildStore selects and constructs a persistence.Store based on config.
+// The returned closer (if non-nil) should be called on shutdown to release
+// connections cleanly. Errors at startup are fatal: Harbor's scanner spec
+// has no notion of an adapter without persistence, so misconfiguration
+// fails closed rather than silently using memory.
+func buildStore(cfg config.PersistenceConfig) (persistence.Store, func(), error) {
+	switch cfg.Backend {
+	case "", config.BackendMemory:
+		s := memory.NewStore(
+			memory.WithRetention(cfg.Memory.Retention),
+			memory.WithCleanupInterval(cfg.Memory.CleanupInterval),
+		)
+		slog.Info("Memory store configured",
+			slog.Duration("retention", cfg.Memory.Retention),
+			slog.Duration("cleanup_interval", cfg.Memory.CleanupInterval),
+		)
+		return s, s.Close, nil
+
+	case config.BackendRedis:
+		if cfg.Redis.URL == "" {
+			return nil, nil, fmt.Errorf("PERSISTENCE_BACKEND=redis requires REDIS_URL")
+		}
+		opts, err := redis.ParseURL(cfg.Redis.URL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing REDIS_URL: %w", err)
+		}
+		client := redis.NewClient(opts)
+
+		// Fail fast on bad credentials / unreachable host so the pod
+		// crashloops with a clear message instead of silently 500ing
+		// every scan.
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.Ping(pingCtx).Err(); err != nil {
+			_ = client.Close()
+			return nil, nil, fmt.Errorf("redis ping at %s: %w", opts.Addr, err)
+		}
+
+		s := persistenceredis.NewStore(client, persistenceredis.WithTTL(cfg.Redis.TTL))
+		return s, func() { _ = client.Close() }, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unknown PERSISTENCE_BACKEND %q (expected %q or %q)",
+			cfg.Backend, config.BackendMemory, config.BackendRedis)
+	}
 }

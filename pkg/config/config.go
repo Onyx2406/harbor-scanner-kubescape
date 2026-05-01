@@ -12,6 +12,18 @@ type BuildInfo struct {
 	Date    string
 }
 
+// PersistenceBackend names a Store implementation.
+type PersistenceBackend string
+
+const (
+	// BackendMemory is the in-process map. Single-pod, non-durable; default
+	// for local dev. See pkg/persistence/memory.
+	BackendMemory PersistenceBackend = "memory"
+	// BackendRedis is the Redis-backed Store. Survives restart/rollout and
+	// supports multi-replica deployments. See pkg/persistence/redis.
+	BackendRedis PersistenceBackend = "redis"
+)
+
 // Config holds all configuration for the scanner adapter.
 type Config struct {
 	API         APIConfig
@@ -28,15 +40,30 @@ type ScanConfig struct {
 	ReuseTTL time.Duration
 }
 
-// PersistenceConfig holds knobs for the in-memory persistence store. See
-// pkg/persistence/memory for behavior details. Issue #17.
+// PersistenceConfig selects the Store backend and its tuning knobs. See
+// issue #15 for the durable-store rationale and issue #17 for the in-memory
+// retention janitor.
 type PersistenceConfig struct {
-	// MemoryRetention is how long a Finished/Failed job is kept in memory
-	// before the janitor evicts it. Long enough to outlast Harbor's poll
-	// loop; short enough to bound memory.
-	MemoryRetention time.Duration
-	// MemoryCleanupInterval is how often the janitor runs.
-	MemoryCleanupInterval time.Duration
+	Backend PersistenceBackend
+	Memory  MemoryConfig
+	Redis   RedisConfig
+}
+
+// MemoryConfig tunes the in-process memory store. Issue #17.
+type MemoryConfig struct {
+	// Retention is how long a Finished/Failed job is kept in memory before
+	// the janitor evicts it. Long enough to outlast Harbor's poll loop;
+	// short enough to bound memory.
+	Retention time.Duration
+	// CleanupInterval is how often the janitor runs.
+	CleanupInterval time.Duration
+}
+
+// RedisConfig holds Redis connection and retention settings. URL is parsed
+// by go-redis (e.g. redis://:password@host:6379/0).
+type RedisConfig struct {
+	URL string
+	TTL time.Duration
 }
 
 // APIConfig holds HTTP server configuration.
@@ -83,8 +110,15 @@ func Load() (Config, error) {
 			ReuseTTL: durationFromEnv("SCAN_REUSE_TTL", 24*time.Hour),
 		},
 		Persistence: PersistenceConfig{
-			MemoryRetention:       durationFromEnv("MEMORY_STORE_RETENTION", 1*time.Hour),
-			MemoryCleanupInterval: durationFromEnv("MEMORY_STORE_CLEANUP_INTERVAL", 5*time.Minute),
+			Backend: PersistenceBackend(envOrDefault("PERSISTENCE_BACKEND", string(BackendMemory))),
+			Memory: MemoryConfig{
+				Retention:       durationFromEnv("MEMORY_STORE_RETENTION", 1*time.Hour),
+				CleanupInterval: durationFromEnv("MEMORY_STORE_CLEANUP_INTERVAL", 5*time.Minute),
+			},
+			Redis: RedisConfig{
+				URL: os.Getenv("REDIS_URL"),
+				TTL: durationFromEnv("REDIS_JOB_TTL", 1*time.Hour),
+			},
 		},
 	}
 

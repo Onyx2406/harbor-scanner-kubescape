@@ -30,6 +30,30 @@ scanner:
   # Kubernetes namespace where Kubescape components run
   kubevulnNamespace: "kubescape"
 
+# Persistence backend for scan-job state.
+#
+#   memory  (default) in-process map. Single-pod, non-durable. Restart loses
+#                     all in-flight and recently-finished scans. Fine for
+#                     local dev or low-stakes deployments.
+#   redis             Redis-backed store. Survives restart/rollout and lets
+#                     replicaCount > 1 work correctly. Recommended for prod.
+#                     See https://github.com/goharbor/harbor-scanner-kubescape/issues/15.
+persistence:
+  backend: memory
+  redis:
+    # Connection URL parsed by go-redis. Examples:
+    #   redis://harbor-redis-master.harbor.svc.cluster.local:6379/0
+    #   redis://:password@host:6379/0
+    # Leave empty when backend=memory.
+    url: ""
+    # Optional: name of an existing Secret holding REDIS_URL under the key
+    # "url". If set, takes precedence over .Values.persistence.redis.url so
+    # passwords don't end up in plain-text values.
+    secretName: ""
+    # Per-key TTL. A scan job lives this long after its last update. Long
+    # enough to outlast Harbor's poll loop; short enough to bound storage.
+    ttl: "1h"
+
 # TLS configuration. When enabled, the scanner serves HTTPS using the cert/key
 # from the referenced Secret (which must contain `tls.crt` and `tls.key` keys,
 # i.e. a kubernetes.io/tls Secret). When disabled, the scanner serves plain
