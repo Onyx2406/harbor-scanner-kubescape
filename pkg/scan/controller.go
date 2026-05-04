@@ -63,13 +63,27 @@ func NewController(store persistence.Store, scanner Scanner, k8sClient k8s.Clien
 	}
 }
 
+// failedWriteTimeout caps the time we'll spend persisting a terminal
+// Failed status during shutdown. Long enough for a healthy Redis to ACK,
+// short enough that a stuck Redis can't block process exit.
+const failedWriteTimeout = 5 * time.Second
+
 func (c *controller) Scan(ctx context.Context, scanJobID string) error {
 	if err := c.scan(ctx, scanJobID); err != nil {
 		slog.Error("Scan failed",
 			slog.String("scan_job_id", scanJobID),
 			slog.String("err", err.Error()),
 		)
-		if updateErr := c.store.UpdateStatus(ctx, scanJobID, persistence.Failed, err.Error()); updateErr != nil {
+		// IMPORTANT: write Failed status using a fresh, uncancelled
+		// context. The inbound ctx may already be Done — that's exactly
+		// why we're here on the graceful-shutdown path (issue #24
+		// cancels scanCtx, which propagates through pollForResults).
+		// Reusing it for the store write would race the Redis SET to
+		// context.Canceled and leave the job Pending until TTL expiry.
+		// See issue #29.
+		writeCtx, cancel := context.WithTimeout(context.Background(), failedWriteTimeout)
+		defer cancel()
+		if updateErr := c.store.UpdateStatus(writeCtx, scanJobID, persistence.Failed, err.Error()); updateErr != nil {
 			slog.Error("Failed to update scan job status",
 				slog.String("scan_job_id", scanJobID),
 				slog.String("err", updateErr.Error()),

@@ -6,10 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/k8s"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence/memory"
+	persistenceredis "github.com/goharbor/harbor-scanner-kubescape/pkg/persistence/redis"
+	"github.com/redis/go-redis/v9"
 )
 
 // fakeK8sClient is a minimal in-memory k8s.Client for testing the controller.
@@ -405,5 +408,72 @@ func TestPollForResults_ZeroStaleSeenAt(t *testing.T) {
 	}
 	if len(report.Vulnerabilities) != 1 || report.Vulnerabilities[0].ID != "CVE-2024-NEW" {
 		t.Errorf("expected fresh CVE-2024-NEW in report, got %+v", report.Vulnerabilities)
+	}
+}
+
+// TestScan_RedisFailedWrite_UsesUncancelledCtx pins issue #29.
+//
+// Issue #24 cancels the shared scanCtx on graceful shutdown. The controller
+// inherits that ctx, sees ctx.Done in pollForResults, returns ctx.Err, and
+// the wrapper Scan() must then write Failed status to the store. Before
+// this fix the write reused the *same* cancelled ctx — Redis SET would
+// race to context.Canceled, the status would stay Pending, and Harbor
+// would keep getting 302 polling for a job that's never going to finish.
+//
+// The test simulates that exact path against a real-ish Redis (miniredis):
+// pre-create a job in Redis, hand the controller a cancelled ctx, run
+// Scan, then assert the job ends up Failed (not Pending or Queued) when
+// read back via a fresh ctx.
+func TestScan_RedisFailedWrite_UsesUncancelledCtx(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	store := persistenceredis.NewStore(rdb)
+	freshCtx := context.Background()
+
+	job := persistence.ScanJob{
+		ID: "job-shutdown",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(freshCtx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// k8sClient nil → controller's scan() returns ErrK8sUnavailable
+	// without touching the network. The interesting part is what the
+	// wrapper Scan() does afterwards: it MUST write Failed even though
+	// the ctx we hand in is already done.
+	c := NewController(store, &fakeScanner{}, nil, "kubescape", DefaultReuseTTL)
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Run Scan with the already-cancelled ctx, mimicking what happens
+	// after main.go's cancelScans() fires on SIGTERM.
+	_ = c.Scan(cancelledCtx, job.ID)
+
+	// Read the persisted state with a FRESH ctx — the cancelled one
+	// would itself fail the Redis GET. We want to know what was actually
+	// written.
+	got, err := store.Get(freshCtx, job.ID)
+	if err != nil {
+		t.Fatalf("post-scan Get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("job missing after Scan; expected Failed status")
+	}
+	if got.Status != persistence.Failed {
+		t.Errorf("status = %s, want Failed — the wrapper used the cancelled ctx and the Redis SET silently failed (issue #29 regression)", got.Status)
+	}
+	if got.Error == "" {
+		t.Errorf("expected job.Error to be populated, got empty string")
 	}
 }
