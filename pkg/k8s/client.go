@@ -59,6 +59,12 @@ type Client interface {
 	// ListVulnerabilityManifests lists VulnerabilityManifests in a namespace,
 	// optionally filtered by label selector.
 	ListVulnerabilityManifests(ctx context.Context, namespace, labelSelector string) ([]VulnerabilityManifest, error)
+
+	// Ping verifies connectivity to the Kubernetes API and that the
+	// current bearer token is still valid. Used by the readiness probe so
+	// post-rotation auth failures take the pod out of rotation instead of
+	// only surfacing at scan time. See issue #30.
+	Ping(ctx context.Context) error
 }
 
 const (
