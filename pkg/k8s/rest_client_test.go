@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -68,7 +71,7 @@ func TestGetVulnerabilityManifest_CanonicalUnmarshal(t *testing.T) {
 	srv := newCRDServer(crdJSON)
 	defer srv.Close()
 
-	c := NewRESTClient(srv.URL, "test-token")
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
 
 	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "core.harbor.domain-library-nginx-abc123")
 	if err != nil {
@@ -194,7 +197,7 @@ func TestGetVulnerabilityManifest_CweExtraction(t *testing.T) {
 	srv := newCRDServer(crdJSON)
 	defer srv.Close()
 
-	c := NewRESTClient(srv.URL, "test-token")
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
 
 	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "core.harbor.domain-library-nginx-abc123")
 	if err != nil {
@@ -227,7 +230,7 @@ func TestGetVulnerabilityManifest_NotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewRESTClient(srv.URL, "test-token")
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
 
 	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "missing")
 	if err != nil {
@@ -259,4 +262,91 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestFileTokenSource_RereadsOnEveryCall pins issue #30: the REST client
+// must pick up service-account token rotation. We point FileTokenSource at
+// a temp file, observe the bearer token sent to a httptest server, then
+// rewrite the file and observe the new token on the next request — without
+// reconstructing the client.
+func TestFileTokenSource_RereadsOnEveryCall(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("token-v1"), 0600); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+
+	var seenAuth atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"major":"1","minor":"29"}`))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, FileTokenSource(tokenPath))
+
+	if err := c.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping #1: %v", err)
+	}
+	if got := seenAuth.Load().(string); got != "Bearer token-v1" {
+		t.Errorf("first Ping Authorization = %q, want Bearer token-v1", got)
+	}
+
+	// Simulate kubelet rotating the token file underneath us.
+	if err := os.WriteFile(tokenPath, []byte("token-v2"), 0600); err != nil {
+		t.Fatalf("rotate token: %v", err)
+	}
+
+	if err := c.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping #2: %v", err)
+	}
+	if got := seenAuth.Load().(string); got != "Bearer token-v2" {
+		t.Errorf("post-rotation Authorization = %q, want Bearer token-v2 — token was cached at startup, regression on issue #30", got)
+	}
+}
+
+// TestPing_SurfacesAuthFailure confirms that a 401 from the K8s API turns
+// into a Ping error, which is what the readiness check uses to flip the
+// pod to NotReady.
+func TestPing_SurfacesAuthFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("expired"))
+
+	err := c.Ping(context.Background())
+	if err == nil {
+		t.Fatal("expected Ping to fail when API returns 401")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("expected error to mention 401, got %v", err)
+	}
+}
+
+// TestPing_OK covers the happy path so a regression that ALWAYS errors
+// would be caught.
+func TestPing_OK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"major":"1","minor":"29"}`))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+	if err := c.Ping(context.Background()); err != nil {
+		t.Errorf("Ping should succeed, got %v", err)
+	}
+}
+
+// TestFileTokenSource_MissingFile surfaces a helpful error when the SA
+// token path is wrong. main.go gates on os.Stat at startup so this won't
+// happen in production, but the failure mode should still be informative.
+func TestFileTokenSource_MissingFile(t *testing.T) {
+	src := FileTokenSource("/nonexistent/no/such/path")
+	if _, err := src(); err == nil {
+		t.Error("expected error reading missing token file")
+	}
 }

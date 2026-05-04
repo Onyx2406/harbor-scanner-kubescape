@@ -72,18 +72,23 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	// Initialize K8s client for VulnerabilityManifest CRD access.
 	// Uses in-cluster service account when running in Kubernetes.
 	// Falls back to no-K8s mode (direct kubevuln only) when not in cluster.
+	//
+	// The token is NOT read into memory once at startup — that pattern broke
+	// when kubelet rotated the projected token (#30). Instead the REST client
+	// reads it fresh from disk on every request via FileTokenSource.
+	const saTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	var k8sClient k8s.Client
 	k8sAPIServer := os.Getenv("KUBERNETES_SERVICE_HOST")
-	k8sToken, _ := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	if k8sAPIServer != "" && len(k8sToken) > 0 {
+	if _, err := os.Stat(saTokenPath); err == nil && k8sAPIServer != "" {
 		k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
 		if k8sPort == "" {
 			k8sPort = "443"
 		}
 		baseURL := "https://" + k8sAPIServer + ":" + k8sPort
-		k8sClient = k8s.NewRESTClient(baseURL, string(k8sToken))
+		k8sClient = k8s.NewRESTClient(baseURL, k8s.FileTokenSource(saTokenPath))
 		slog.Info("K8s client initialized for VulnerabilityManifest CRD access",
 			slog.String("api_server", baseURL),
+			slog.String("token_path", saTokenPath),
 		)
 	} else {
 		slog.Warn("Not running in Kubernetes cluster — VulnerabilityManifest CRD lookup disabled. " +
@@ -105,12 +110,20 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	//     runtime takes the pod out of rotation. See issue #25.
 	readiness := []v1.ReadinessCheck{
 		{
+			// Authenticated kubernetes-client check (issue #30).
+			// Pre-#30 this was a nil check, which silently stayed green
+			// after a token rotation 401 — the pod looked Ready while
+			// every scan returned 500. Now we hit /version on each probe
+			// with the freshest token, so 401/403/network errors take
+			// the pod NotReady.
 			Name: "kubernetes-client",
 			Check: func() error {
 				if k8sClient == nil {
 					return fmt.Errorf("kubernetes client unavailable; pod cannot read VulnerabilityManifest CRDs")
 				}
-				return nil
+				ctx, cancel := context.WithTimeout(context.Background(), readinessCheckTimeout)
+				defer cancel()
+				return k8sClient.Ping(ctx)
 			},
 		},
 	}
