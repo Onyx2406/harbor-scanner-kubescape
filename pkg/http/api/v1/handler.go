@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/config"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
@@ -44,6 +45,18 @@ type requestHandler struct {
 	store           persistence.Store
 	controller      scan.Controller
 	readinessChecks []ReadinessCheck
+
+	// scanCtx is the parent context inherited by every async scan goroutine.
+	// When cancelled (typically on SIGTERM), the goroutines see ctx.Done in
+	// pollForResults and the controller's wrapper records the job as Failed
+	// instead of leaving it Pending until TTL expiry. See issue #24. May be
+	// nil — falls back to context.Background() with no cancellation.
+	scanCtx context.Context
+
+	// scanWG counts in-flight scan goroutines so the shutdown path can wait
+	// for them to record Failed status before the process exits. May be nil
+	// in tests that don't care about graceful shutdown.
+	scanWG *sync.WaitGroup
 }
 
 // NewAPIHandler creates the HTTP handler with all Harbor Scanner API routes.
@@ -52,19 +65,32 @@ type requestHandler struct {
 // returns an error the probe responds 503 with a JSON listing the failing
 // subsystems, otherwise 200. /probe/healthy stays 200 unconditionally —
 // liveness reflects the process being up, not its ability to serve.
+//
+// scanCtx and scanWG (both may be nil) plumb a process-lifetime cancellable
+// context and an in-flight counter into async scan goroutines. main.go
+// passes a real ctx + wg so SIGTERM can cancel running scans and wait for
+// them to record Failed status; tests typically pass nil for both. See
+// issue #24.
 func NewAPIHandler(
 	buildInfo config.BuildInfo,
 	cfg config.Config,
 	store persistence.Store,
 	controller scan.Controller,
+	scanCtx context.Context,
+	scanWG *sync.WaitGroup,
 	readinessChecks ...ReadinessCheck,
 ) http.Handler {
+	if scanCtx == nil {
+		scanCtx = context.Background()
+	}
 	h := &requestHandler{
 		buildInfo:       buildInfo,
 		config:          cfg,
 		store:           store,
 		controller:      controller,
 		readinessChecks: readinessChecks,
+		scanCtx:         scanCtx,
+		scanWG:          scanWG,
 	}
 
 	router := mux.NewRouter()
@@ -154,12 +180,21 @@ func (h *requestHandler) AcceptScanRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Launch scan asynchronously.
-	// Use a detached context because r.Context() is cancelled when the HTTP response is sent.
+	// Launch scan asynchronously. The goroutine inherits h.scanCtx (NOT
+	// r.Context(), which is cancelled when the HTTP response is sent) so
+	// that on SIGTERM the controller's poll loop sees ctx.Done, returns
+	// ctx.Err, and the wrapper Scan() writes Failed("interrupted") to the
+	// store rather than leaving the job Pending until TTL expiry.
+	// See issue #24.
 	if h.controller != nil {
+		if h.scanWG != nil {
+			h.scanWG.Add(1)
+		}
 		go func() {
-			scanCtx := context.Background()
-			if err := h.controller.Scan(scanCtx, scanJobID); err != nil {
+			if h.scanWG != nil {
+				defer h.scanWG.Done()
+			}
+			if err := h.controller.Scan(h.scanCtx, scanJobID); err != nil {
 				slog.Error("Async scan failed",
 					slog.String("scan_job_id", scanJobID),
 					slog.String("err", err.Error()),
