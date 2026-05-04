@@ -11,11 +11,17 @@ import (
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence"
 )
 
-const (
-	// How often to poll for VulnerabilityManifest CRD after triggering a scan.
+// pollInterval and pollTimeout are vars (not consts) so tests can shorten
+// them via t.Cleanup. Production always uses the defaults.
+var (
+	// pollInterval is how often to poll for VulnerabilityManifest CRD after
+	// triggering a scan.
 	pollInterval = 5 * time.Second
-	// Maximum time to wait for a scan to complete.
+	// pollTimeout is the maximum time to wait for a scan to complete.
 	pollTimeout = 10 * time.Minute
+)
+
+const (
 	// DefaultReuseTTL is the default freshness window for reusing an existing
 	// VulnerabilityManifest. Anything older triggers a fresh scan so newly
 	// disclosed CVEs in the Grype DB get picked up. See issue #14.
@@ -115,6 +121,14 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	// rescanned every time, and vulnerable manifests were reused forever
 	// even after the Grype DB or scanner version changed (issue #14).
 	existing, err := c.k8sClient.GetVulnerabilityManifest(ctx, c.namespace, crdName)
+
+	// staleSeenAt is the CreatedAt of any existing-but-stale CRD we observed
+	// before triggering the rescan. The poll loop only accepts manifests with
+	// CreatedAt strictly newer than this — otherwise it would happily return
+	// the same stale CRD it just rejected on the very next tick, before
+	// kubevuln has had a chance to overwrite it. See issue #23.
+	var staleSeenAt time.Time
+
 	if err != nil {
 		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
 			slog.String("err", err.Error()),
@@ -132,6 +146,7 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		}
 		return c.store.UpdateStatus(ctx, scanJobID, persistence.Finished)
 	} else if existing != nil {
+		staleSeenAt = existing.CreatedAt
 		slog.Info("Existing VulnerabilityManifest is stale, triggering fresh scan",
 			slog.String("crd_name", crdName),
 			slog.Time("created_at", existing.CreatedAt),
@@ -149,8 +164,10 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		return fmt.Errorf("triggering kubevuln scan: %w", err)
 	}
 
-	// Step 3: Poll for VulnerabilityManifest CRD
-	report, err := c.pollForResults(ctx, crdName, job.Request.Artifact)
+	// Step 3: Poll for VulnerabilityManifest CRD. Pass staleSeenAt so the
+	// loop ignores any CRD with CreatedAt <= staleSeenAt — i.e. the very
+	// stale object we just rejected, which kubevuln has not yet overwritten.
+	report, err := c.pollForResults(ctx, crdName, job.Request.Artifact, staleSeenAt)
 	if err != nil {
 		return fmt.Errorf("waiting for scan results: %w", err)
 	}
@@ -181,9 +198,16 @@ func (c *controller) canReuse(vm *k8s.VulnerabilityManifest) bool {
 }
 
 // pollForResults polls the Kubernetes API for the VulnerabilityManifest CRD
-// until it appears with results or the timeout is reached.
-func (c *controller) pollForResults(ctx context.Context, crdName string, artifact harbor.Artifact) (harbor.ScanReport, error) {
-	deadline := time.Now().Add(pollTimeout)
+// until a manifest strictly newer than staleSeenAt appears, or the timeout
+// is reached.
+//
+// staleSeenAt is the CreatedAt of any pre-existing stale CRD the controller
+// already rejected as too old (zero if no prior CRD existed). Without this
+// gate, the very first poll tick after triggering a rescan would return the
+// same stale object kubevuln has not yet overwritten — defeating the
+// freshness check. See issue #23.
+func (c *controller) pollForResults(ctx context.Context, crdName string, artifact harbor.Artifact, staleSeenAt time.Time) (harbor.ScanReport, error) {
+	deadline := now().Add(pollTimeout)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -192,7 +216,7 @@ func (c *controller) pollForResults(ctx context.Context, crdName string, artifac
 		case <-ctx.Done():
 			return harbor.ScanReport{}, ctx.Err()
 		case <-ticker.C:
-			if time.Now().After(deadline) {
+			if now().After(deadline) {
 				return harbor.ScanReport{}, fmt.Errorf("timed out waiting for VulnerabilityManifest %s after %v", crdName, pollTimeout)
 			}
 
@@ -205,17 +229,35 @@ func (c *controller) pollForResults(ctx context.Context, crdName string, artifac
 				continue
 			}
 
-			if vm != nil {
-				slog.Info("VulnerabilityManifest found",
+			if vm == nil {
+				slog.Debug("VulnerabilityManifest not yet available, retrying",
 					slog.String("crd_name", crdName),
-					slog.Int("matches", len(vm.Matches)),
 				)
-				return TransformManifestToReport(vm, artifact), nil
+				continue
 			}
 
-			slog.Debug("VulnerabilityManifest not yet available, retrying",
+			if !staleSeenAt.IsZero() && !vm.CreatedAt.After(staleSeenAt) {
+				slog.Debug("Polled VulnerabilityManifest is the stale one, waiting for kubevuln to overwrite",
+					slog.String("crd_name", crdName),
+					slog.Time("created_at", vm.CreatedAt),
+					slog.Time("stale_seen_at", staleSeenAt),
+				)
+				continue
+			}
+
+			if vm.CreatedAt.IsZero() {
+				slog.Warn("Polled VulnerabilityManifest has zero CreatedAt, treating as not-yet-ready",
+					slog.String("crd_name", crdName),
+				)
+				continue
+			}
+
+			slog.Info("VulnerabilityManifest found",
 				slog.String("crd_name", crdName),
+				slog.Int("matches", len(vm.Matches)),
+				slog.Time("created_at", vm.CreatedAt),
 			)
+			return TransformManifestToReport(vm, artifact), nil
 		}
 	}
 }
