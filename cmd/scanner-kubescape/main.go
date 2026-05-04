@@ -57,7 +57,7 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		slog.String("commit", buildInfo.Commit),
 	)
 
-	store, storeCloser, err := buildStore(cfg.Persistence)
+	store, storeCloser, storeReadiness, err := buildStore(cfg.Persistence)
 	if err != nil {
 		return fmt.Errorf("initializing persistence backend: %w", err)
 	}
@@ -96,10 +96,12 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	)
 	controller := scan.NewController(store, scanner, k8sClient, cfg.Kubevuln.Namespace, cfg.Scan.ReuseTTL)
 
-	// Readiness gates. The k8s-client check makes the pod NotReady when the
-	// adapter cannot observe VulnerabilityManifest CRDs, so Kubernetes won't
-	// route Harbor traffic to a pod that would only emit ErrK8sUnavailable.
-	// See issue #16.
+	// Readiness gates. Composed from:
+	//   * kubernetes-client — the adapter cannot observe scan results without
+	//     it, so the pod must be NotReady when nil. See issue #16.
+	//   * backend-specific checks returned by buildStore — for the Redis
+	//     backend this is a live, timeout-bounded Ping so a Redis outage at
+	//     runtime takes the pod out of rotation. See issue #25.
 	readiness := []v1.ReadinessCheck{
 		{
 			Name: "kubernetes-client",
@@ -111,6 +113,7 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 			},
 		},
 	}
+	readiness = append(readiness, storeReadiness...)
 
 	handler := v1.NewAPIHandler(buildInfo, cfg, store, controller, readiness...)
 
@@ -159,12 +162,20 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	return nil
 }
 
-// buildStore selects and constructs a persistence.Store based on config.
+// readinessCheckTimeout is how long a backend readiness check is allowed to
+// run before being treated as a failure. Tight on purpose — readiness fires
+// every few seconds and we don't want a slow Redis to become a self-DoS.
+const readinessCheckTimeout = 2 * time.Second
+
+// buildStore selects and constructs a persistence.Store based on config and
+// returns the backend-specific readiness checks the handler should run on
+// every /probe/ready hit (issue #25).
+//
 // The returned closer (if non-nil) should be called on shutdown to release
 // connections cleanly. Errors at startup are fatal: Harbor's scanner spec
 // has no notion of an adapter without persistence, so misconfiguration
 // fails closed rather than silently using memory.
-func buildStore(cfg config.PersistenceConfig) (persistence.Store, func(), error) {
+func buildStore(cfg config.PersistenceConfig) (persistence.Store, func(), []v1.ReadinessCheck, error) {
 	switch cfg.Backend {
 	case "", config.BackendMemory:
 		s := memory.NewStore(
@@ -175,15 +186,16 @@ func buildStore(cfg config.PersistenceConfig) (persistence.Store, func(), error)
 			slog.Duration("retention", cfg.Memory.Retention),
 			slog.Duration("cleanup_interval", cfg.Memory.CleanupInterval),
 		)
-		return s, s.Close, nil
+		// Memory backend has no remote dependency; nothing to probe.
+		return s, s.Close, nil, nil
 
 	case config.BackendRedis:
 		if cfg.Redis.URL == "" {
-			return nil, nil, fmt.Errorf("PERSISTENCE_BACKEND=redis requires REDIS_URL")
+			return nil, nil, nil, fmt.Errorf("PERSISTENCE_BACKEND=redis requires REDIS_URL")
 		}
 		opts, err := redis.ParseURL(cfg.Redis.URL)
 		if err != nil {
-			return nil, nil, fmt.Errorf("parsing REDIS_URL: %w", err)
+			return nil, nil, nil, fmt.Errorf("parsing REDIS_URL: %w", err)
 		}
 		client := redis.NewClient(opts)
 
@@ -194,14 +206,28 @@ func buildStore(cfg config.PersistenceConfig) (persistence.Store, func(), error)
 		defer cancel()
 		if err := client.Ping(pingCtx).Err(); err != nil {
 			_ = client.Close()
-			return nil, nil, fmt.Errorf("redis ping at %s: %w", opts.Addr, err)
+			return nil, nil, nil, fmt.Errorf("redis ping at %s: %w", opts.Addr, err)
 		}
 
 		s := persistenceredis.NewStore(client, persistenceredis.WithTTL(cfg.Redis.TTL))
-		return s, func() { _ = client.Close() }, nil
+
+		// Live readiness probe — runs on every /probe/ready hit. A Redis
+		// outage at runtime now takes the pod out of rotation instead of
+		// leaving it Ready while every Create/Get fails (issue #25).
+		checks := []v1.ReadinessCheck{
+			{
+				Name: "redis",
+				Check: func() error {
+					ctx, cancel := context.WithTimeout(context.Background(), readinessCheckTimeout)
+					defer cancel()
+					return s.Ping(ctx)
+				},
+			},
+		}
+		return s, func() { _ = client.Close() }, checks, nil
 
 	default:
-		return nil, nil, fmt.Errorf("unknown PERSISTENCE_BACKEND %q (expected %q or %q)",
+		return nil, nil, nil, fmt.Errorf("unknown PERSISTENCE_BACKEND %q (expected %q or %q)",
 			cfg.Backend, config.BackendMemory, config.BackendRedis)
 	}
 }
