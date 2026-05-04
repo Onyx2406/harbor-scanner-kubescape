@@ -155,10 +155,10 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 			slog.Duration("ttl", c.reuseTTL),
 		)
 		report := TransformManifestToReport(existing, job.Request.Artifact)
-		if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
-			return err
-		}
-		return c.store.UpdateStatus(ctx, scanJobID, persistence.Finished)
+		// Atomic: publish report and Finished status in one store op so
+		// Harbor cannot poll a Finished status before the report lands,
+		// nor a Pending status while the report is already saved. See #31.
+		return c.store.SetFinished(ctx, scanJobID, report)
 	} else if existing != nil {
 		staleSeenAt = existing.CreatedAt
 		slog.Info("Existing VulnerabilityManifest is stale, triggering fresh scan",
@@ -185,11 +185,12 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	if err != nil {
 		return fmt.Errorf("waiting for scan results: %w", err)
 	}
-	if err := c.store.UpdateReport(ctx, scanJobID, report); err != nil {
-		return err
-	}
 
-	if err := c.store.UpdateStatus(ctx, scanJobID, persistence.Finished); err != nil {
+	// Atomic publication: a single store op transitions the job to
+	// Finished AND saves the report. Eliminates the crash window between
+	// UpdateReport and UpdateStatus that left reports invisible behind a
+	// stale Pending status (issue #31).
+	if err := c.store.SetFinished(ctx, scanJobID, report); err != nil {
 		return err
 	}
 

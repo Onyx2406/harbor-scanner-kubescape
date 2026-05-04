@@ -140,6 +140,22 @@ func (s *Store) UpdateReport(_ context.Context, id string, report harbor.ScanRep
 	return nil
 }
 
+// SetFinished atomically publishes the report and transitions the job to
+// Finished, under one mutex acquisition so a concurrent Get can never
+// observe Finished-without-report or report-with-Pending. See issue #31.
+func (s *Store) SetFinished(_ context.Context, id string, report harbor.ScanReport) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok {
+		return fmt.Errorf("scan job not found: %s", id)
+	}
+	job.Report = report
+	job.Status = persistence.Finished
+	job.TerminalAt = s.now()
+	return nil
+}
+
 // Len returns the current number of jobs in the store. Useful for tests
 // asserting eviction; not part of any public interface.
 func (s *Store) Len() int {

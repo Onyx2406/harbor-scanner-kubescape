@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/persistence"
 )
 
@@ -151,5 +152,52 @@ func mustCreate(t *testing.T, s *Store, id string) {
 	t.Helper()
 	if err := s.Create(context.Background(), persistence.ScanJob{ID: id, Status: persistence.Queued}); err != nil {
 		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// TestSetFinished_PublishesAtomically pins issue #31 for the memory store:
+// SetFinished moves the job to Finished AND saves the report in a single
+// store operation. After it returns, no Get can observe Finished without
+// the report or report without Finished.
+func TestSetFinished_PublishesAtomically(t *testing.T) {
+	fixedNow := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	s := NewStore(WithNow(func() time.Time { return fixedNow }))
+	defer s.Close()
+	ctx := context.Background()
+
+	mustCreate(t, s, "job-final")
+
+	report := harbor.ScanReport{
+		Scanner: harbor.Scanner{Name: "Kubescape", Version: "0.74.0"},
+		Vulnerabilities: []harbor.VulnerabilityItem{
+			{ID: "CVE-2024-9999", Severity: harbor.SevHigh},
+		},
+	}
+	if err := s.SetFinished(ctx, "job-final", report); err != nil {
+		t.Fatalf("SetFinished: %v", err)
+	}
+
+	got, err := s.Get(ctx, "job-final")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != persistence.Finished {
+		t.Errorf("status = %s, want Finished", got.Status)
+	}
+	if len(got.Report.Vulnerabilities) != 1 || got.Report.Vulnerabilities[0].ID != "CVE-2024-9999" {
+		t.Errorf("report not published with status: got %+v", got.Report.Vulnerabilities)
+	}
+	if !got.TerminalAt.Equal(fixedNow) {
+		t.Errorf("TerminalAt = %v, want %v (SetFinished must mark the terminal moment)", got.TerminalAt, fixedNow)
+	}
+}
+
+// TestSetFinished_NotFound mirrors UpdateStatus/UpdateReport: missing key
+// returns an error rather than silently re-creating.
+func TestSetFinished_NotFound(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	if err := s.SetFinished(context.Background(), "ghost", harbor.ScanReport{}); err == nil {
+		t.Error("expected SetFinished on missing key to error")
 	}
 }

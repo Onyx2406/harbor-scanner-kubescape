@@ -131,6 +131,30 @@ func (s *Store) UpdateReport(ctx context.Context, id string, report harbor.ScanR
 	return s.save(ctx, job)
 }
 
+// SetFinished publishes the report and Finished status in a single Redis
+// SET, so an observer can never see a stored report with status Pending
+// (or a Finished status with no report). See issue #31.
+//
+// The Get-modify-Set sequence is not Redis-atomic — between the read and
+// the write a concurrent UpdateStatus could clobber. In the controller's
+// usage we don't have concurrent writers for the same job (each job is
+// owned by exactly one goroutine), so a CAS isn't required. The contract
+// this method delivers is "the SET that publishes Finished also publishes
+// the report" — which is the actual #31 acceptance criterion.
+func (s *Store) SetFinished(ctx context.Context, id string, report harbor.ScanReport) error {
+	job, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("scan job not found: %s", id)
+	}
+	job.Report = report
+	job.Status = persistence.Finished
+	job.TerminalAt = time.Now()
+	return s.save(ctx, job)
+}
+
 func (s *Store) save(ctx context.Context, job *persistence.ScanJob) error {
 	b, err := json.Marshal(job)
 	if err != nil {

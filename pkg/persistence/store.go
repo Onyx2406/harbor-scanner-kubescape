@@ -53,4 +53,12 @@ type Store interface {
 	Get(ctx context.Context, id string) (*ScanJob, error)
 	UpdateStatus(ctx context.Context, id string, status ScanJobStatus, errMsg ...string) error
 	UpdateReport(ctx context.Context, id string, report harbor.ScanReport) error
+
+	// SetFinished publishes the scan report and the Finished status as a
+	// single store operation. The previous two-call pattern
+	// (UpdateReport followed by UpdateStatus) had a window where a crash
+	// or transient backend failure between the two writes left a stored
+	// report behind a stale Pending status — Harbor would keep getting
+	// 302s for a scan that already had a result waiting. See issue #31.
+	SetFinished(ctx context.Context, id string, report harbor.ScanReport) error
 }

@@ -205,3 +205,51 @@ func TestReadinessCheck_Shape(t *testing.T) {
 		t.Errorf("expected check to fail when miniredis is closed; pod would stay Ready while every scan write 500s")
 	}
 }
+
+// TestSetFinished_PublishesAtomically pins issue #31 for the Redis store:
+// SetFinished publishes the report and Finished status in a single SET so
+// a concurrent Get can never see one without the other. Pre-fix the
+// controller used UpdateReport-then-UpdateStatus, leaving a race window
+// where a Redis failure between the two writes left the report stored
+// behind a stale Pending status.
+func TestSetFinished_PublishesAtomically(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.Create(ctx, persistence.ScanJob{ID: "job-atomic", Status: persistence.Queued}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	report := harbor.ScanReport{
+		Scanner: harbor.Scanner{Name: "Kubescape", Version: "0.74.0"},
+		Vulnerabilities: []harbor.VulnerabilityItem{
+			{ID: "CVE-2024-9999", Severity: harbor.SevHigh},
+		},
+	}
+	if err := s.SetFinished(ctx, "job-atomic", report); err != nil {
+		t.Fatalf("SetFinished: %v", err)
+	}
+
+	got, err := s.Get(ctx, "job-atomic")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != persistence.Finished {
+		t.Errorf("status = %s, want Finished", got.Status)
+	}
+	if len(got.Report.Vulnerabilities) != 1 || got.Report.Vulnerabilities[0].ID != "CVE-2024-9999" {
+		t.Errorf("report not published with status: got %+v", got.Report.Vulnerabilities)
+	}
+	if got.TerminalAt.IsZero() {
+		t.Error("expected TerminalAt to be set on SetFinished")
+	}
+}
+
+// TestSetFinished_NotFound — missing key on SetFinished should error,
+// matching the contract for UpdateStatus / UpdateReport.
+func TestSetFinished_NotFound(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.SetFinished(context.Background(), "ghost", harbor.ScanReport{}); err == nil {
+		t.Error("expected SetFinished on missing key to error")
+	}
+}
