@@ -13,14 +13,21 @@ import (
 )
 
 // fakeK8sClient is a minimal in-memory k8s.Client for testing the controller.
-// GetVulnerabilityManifest returns the seeded manifest (or nil to simulate not
-// found). TriggerCount is incremented every time the controller asks the
-// scanner to run, which lets tests assert reuse vs rescan decisions.
+// GetVulnerabilityManifest returns the current `manifest` field. Tests that
+// need the response to change over time can use `getHook` — when set, it is
+// invoked on every Get and may mutate `manifest` to simulate kubevuln
+// asynchronously overwriting the CRD between polls.
 type fakeK8sClient struct {
 	manifest *k8s.VulnerabilityManifest
+	getCalls int
+	getHook  func(callIdx int, f *fakeK8sClient)
 }
 
 func (f *fakeK8sClient) GetVulnerabilityManifest(_ context.Context, _, _ string) (*k8s.VulnerabilityManifest, error) {
+	f.getCalls++
+	if f.getHook != nil {
+		f.getHook(f.getCalls, f)
+	}
 	return f.manifest, nil
 }
 
@@ -284,4 +291,119 @@ func (s *triggerCancellingScanner) TriggerScan(_ context.Context, _ harbor.ScanR
 	s.triggers++
 	s.cancel()
 	return nil
+}
+
+// TestScan_StaleManifestNotReturnedByPoll pins issue #23: after the
+// controller decides an existing CRD is stale and triggers a rescan, the
+// poll loop must NOT immediately accept that same stale CRD on the next
+// tick. It must wait until kubevuln overwrites it with a strictly-newer
+// CreatedAt.
+//
+// We drive the test with a stateful fake k8s client. Calls 1 (initial
+// check) and 2 (first poll tick) return the stale CRD. On call 3, the
+// fake mutates its state to simulate kubevuln finishing the scan: the
+// manifest now has a fresh CreatedAt. The test asserts the final report
+// reflects the fresh data, NOT the stale one.
+func TestScan_StaleManifestNotReturnedByPoll(t *testing.T) {
+	fixedNow := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	now = func() time.Time { return fixedNow }
+	t.Cleanup(func() { now = time.Now })
+
+	// Shorten the poll interval so the test finishes quickly.
+	pollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { pollInterval = 5 * time.Second })
+
+	staleCRD := &k8s.VulnerabilityManifest{
+		Name:      "nginx",
+		CreatedAt: fixedNow.Add(-30 * 24 * time.Hour),
+		Matches:   []k8s.VulnMatch{{ID: "CVE-2024-OLD", Severity: "Low"}},
+	}
+	freshCRD := &k8s.VulnerabilityManifest{
+		Name:      "nginx",
+		CreatedAt: fixedNow,
+		Matches: []k8s.VulnMatch{
+			{ID: "CVE-2024-NEW", Severity: "Critical"},
+		},
+	}
+
+	fakeK8s := &fakeK8sClient{
+		manifest: staleCRD,
+		// On the third Get (initial-check + one stale-poll + this one),
+		// simulate kubevuln overwriting the CRD with the fresh version.
+		getHook: func(callIdx int, f *fakeK8sClient) {
+			if callIdx >= 3 {
+				f.manifest = freshCRD
+			}
+		},
+	}
+	scanner := &fakeScanner{}
+
+	store := memory.NewStore()
+	ctx := context.Background()
+
+	job := persistence.ScanJob{
+		ID: "job-stale-poll",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
+	if err := c.Scan(ctx, job.ID); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if scanner.triggers != 1 {
+		t.Errorf("scanner.triggers = %d, want 1 (stale CRD must trigger exactly one rescan)", scanner.triggers)
+	}
+
+	got, _ := store.Get(ctx, job.ID)
+	if got.Status != persistence.Finished {
+		t.Fatalf("expected status Finished, got %s (job.Error=%q)", got.Status, got.Error)
+	}
+	if len(got.Report.Vulnerabilities) != 1 {
+		t.Fatalf("expected 1 vulnerability in report, got %d", len(got.Report.Vulnerabilities))
+	}
+	if got.Report.Vulnerabilities[0].ID != "CVE-2024-NEW" {
+		t.Errorf("report contains stale data: got %q, want CVE-2024-NEW. The poll loop accepted the rejected stale CRD instead of waiting for kubevuln to overwrite.",
+			got.Report.Vulnerabilities[0].ID)
+	}
+	// We expect at least 3 Get calls: initial check + at least one stale poll + the fresh one.
+	if fakeK8s.getCalls < 3 {
+		t.Errorf("expected at least 3 Get calls (init + stale poll + fresh), got %d", fakeK8s.getCalls)
+	}
+}
+
+// TestPollForResults_ZeroStaleSeenAt confirms that when there is no prior
+// stale CRD (staleSeenAt is zero), any non-nil manifest with a non-zero
+// CreatedAt is accepted on the first tick — i.e. we don't break the
+// fresh-scan path while fixing the stale-rescan path.
+func TestPollForResults_ZeroStaleSeenAt(t *testing.T) {
+	pollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { pollInterval = 5 * time.Second })
+
+	freshCRD := &k8s.VulnerabilityManifest{
+		Name:      "nginx",
+		CreatedAt: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+		Matches:   []k8s.VulnMatch{{ID: "CVE-2024-NEW", Severity: "High"}},
+	}
+
+	fakeK8s := &fakeK8sClient{manifest: freshCRD}
+	c := &controller{k8sClient: fakeK8s, namespace: "kubescape"}
+
+	report, err := c.pollForResults(context.Background(), "nginx", harbor.Artifact{}, time.Time{})
+	if err != nil {
+		t.Fatalf("pollForResults: %v", err)
+	}
+	if len(report.Vulnerabilities) != 1 || report.Vulnerabilities[0].ID != "CVE-2024-NEW" {
+		t.Errorf("expected fresh CVE-2024-NEW in report, got %+v", report.Vulnerabilities)
+	}
 }
