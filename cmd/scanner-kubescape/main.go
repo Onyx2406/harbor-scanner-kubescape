@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -112,7 +113,16 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		},
 	}
 
-	handler := v1.NewAPIHandler(buildInfo, cfg, store, controller, readiness...)
+	// scanCtx is the parent for every async scan goroutine. Cancelling it
+	// during shutdown propagates ctx.Done into the controller's poll loop,
+	// which returns ctx.Err and lets the wrapper Scan() record Failed
+	// status in the store before the goroutine exits — instead of leaving
+	// the job Pending until Redis TTL expiry. See issue #24.
+	scanCtx, cancelScans := context.WithCancel(context.Background())
+	defer cancelScans()
+	var scanWG sync.WaitGroup
+
+	handler := v1.NewAPIHandler(buildInfo, cfg, store, controller, scanCtx, &scanWG, readiness...)
 
 	srv := &http.Server{
 		Addr:         cfg.API.Addr,
@@ -122,6 +132,11 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		IdleTimeout:  60 * time.Second,
 	}
 
+	const (
+		httpShutdownTimeout = 10 * time.Second
+		scanShutdownTimeout = 10 * time.Second
+	)
+
 	shutdownComplete := make(chan struct{})
 	go func() {
 		sigint := make(chan os.Signal, 1)
@@ -129,12 +144,32 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 		captured := <-sigint
 		slog.Info("Received signal, shutting down", slog.String("signal", captured.String()))
 
-		shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		if err := srv.Shutdown(shutdownCtx); err != nil {
+		// Step 1: stop accepting new HTTP requests and drain in-flight ones.
+		httpCtx, cancelHTTP := context.WithTimeout(ctx, httpShutdownTimeout)
+		defer cancelHTTP()
+		if err := srv.Shutdown(httpCtx); err != nil {
 			slog.Error("Server shutdown error", slog.String("err", err.Error()))
 		}
+
+		// Step 2: cancel async scan goroutines and wait briefly for them to
+		// record Failed("interrupted") in the store. Ungraceful crashes
+		// that bypass this path will leak Pending jobs until their TTL
+		// expires (REDIS_JOB_TTL or MEMORY_STORE_RETENTION).
+		cancelScans()
+		scansDone := make(chan struct{})
+		go func() {
+			scanWG.Wait()
+			close(scansDone)
+		}()
+		select {
+		case <-scansDone:
+			slog.Info("All in-flight scans recorded a terminal state")
+		case <-time.After(scanShutdownTimeout):
+			slog.Warn("Timed out waiting for in-flight scans to finalize; some jobs may stay Pending until TTL expiry",
+				slog.Duration("timeout", scanShutdownTimeout),
+			)
+		}
+
 		close(shutdownComplete)
 	}()
 

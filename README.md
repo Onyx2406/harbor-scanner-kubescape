@@ -85,6 +85,21 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
   --set service.port=8443
 ```
 
+### Graceful shutdown
+
+On `SIGTERM` (rolling restart, scale-down) the adapter:
+
+1. Stops accepting new HTTP requests and drains in-flight ones (10s budget).
+2. Cancels the parent context shared by all async scan goroutines so their
+   poll loops return promptly with `context.Canceled`.
+3. Waits up to 10s for those goroutines to record `Failed("interrupted by
+   pod shutdown")` in the store, so Harbor sees a clean 500 instead of
+   indefinite 302s. See [#24](https://github.com/goharbor/harbor-scanner-kubescape/issues/24).
+
+Ungraceful crashes (OOM, kernel kill) bypass step 3, so jobs they were
+running can stay `Pending` until they expire via `MEMORY_STORE_RETENTION`
+or `REDIS_JOB_TTL`. Lower the TTL if you want faster orphan cleanup.
+
 ### Persistence and replicas
 
 The adapter ships with two persistence backends:

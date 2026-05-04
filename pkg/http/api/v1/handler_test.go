@@ -2,11 +2,14 @@ package v1
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/config"
 	"github.com/goharbor/harbor-scanner-kubescape/pkg/harbor"
@@ -21,6 +24,8 @@ func TestGetMetadata(t *testing.T) {
 		config.Config{},
 		store,
 		nil, // controller not needed for metadata
+		nil, // scanCtx — defaults to context.Background()
+		nil, // scanWG — no in-flight tracking
 	)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metadata", nil)
@@ -58,6 +63,8 @@ func TestAcceptScanRequest_Valid(t *testing.T) {
 		config.Config{},
 		store,
 		nil, // controller is nil; goroutine guards against nil
+		nil, // scanCtx
+		nil, // scanWG
 	)
 
 	scanReq := harbor.ScanRequest{
@@ -91,7 +98,7 @@ func TestAcceptScanRequest_Valid(t *testing.T) {
 
 func TestAcceptScanRequest_MissingFields(t *testing.T) {
 	store := memory.NewStore()
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
 
 	tests := []struct {
 		name    string
@@ -135,7 +142,7 @@ func TestAcceptScanRequest_MissingFields(t *testing.T) {
 
 func TestGetScanReport_NotFound(t *testing.T) {
 	store := memory.NewStore()
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/scan/nonexistent/report", nil)
 	w := httptest.NewRecorder()
@@ -154,7 +161,7 @@ func TestGetScanReport_Pending(t *testing.T) {
 		Status: persistence.Pending,
 	})
 
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/scan/test-job-1/report", nil)
 	w := httptest.NewRecorder()
@@ -176,7 +183,7 @@ func TestGetScanReport_Finished(t *testing.T) {
 		},
 	})
 
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/scan/test-job-2/report", nil)
 	w := httptest.NewRecorder()
@@ -205,7 +212,7 @@ func TestGetScanReport_Failed(t *testing.T) {
 		Error:  "image pull failed",
 	})
 
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/scan/test-job-3/report", nil)
 	w := httptest.NewRecorder()
@@ -218,7 +225,7 @@ func TestGetScanReport_Failed(t *testing.T) {
 }
 
 func TestHealthProbes(t *testing.T) {
-	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, memory.NewStore(), nil)
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, memory.NewStore(), nil, nil, nil)
 
 	tests := []struct {
 		path string
@@ -247,6 +254,7 @@ func TestHealthProbes(t *testing.T) {
 func TestReady_FailingCheck(t *testing.T) {
 	handler := NewAPIHandler(
 		config.BuildInfo{}, config.Config{}, memory.NewStore(), nil,
+		nil, nil, // scanCtx, scanWG
 		ReadinessCheck{
 			Name:  "kubernetes-client",
 			Check: func() error { return fmt.Errorf("k8s client unavailable") },
@@ -291,11 +299,113 @@ func TestReady_FailingCheck(t *testing.T) {
 	}
 }
 
+// blockingController captures the ctx it was called with and blocks on it
+// until cancellation. Used by the shutdown test to verify scan goroutines
+// inherit the process-lifetime context and exit cleanly when it cancels.
+type blockingController struct {
+	started   chan struct{} // closed once Scan is invoked
+	gotCtx    context.Context
+	gotCtxErr error
+	store     persistence.Store
+}
+
+func (b *blockingController) Scan(ctx context.Context, scanJobID string) error {
+	b.gotCtx = ctx
+	close(b.started)
+	<-ctx.Done()
+	b.gotCtxErr = ctx.Err()
+	if b.store != nil {
+		_ = b.store.UpdateStatus(context.Background(), scanJobID, persistence.Failed, "interrupted by pod shutdown")
+	}
+	return ctx.Err()
+}
+
+// TestAcceptScanRequest_GoroutineRespectsScanCtx pins issue #24: the async
+// scan goroutine launched from AcceptScanRequest must inherit the
+// process-lifetime scanCtx, NOT a detached context.Background(). When that
+// ctx is cancelled (on SIGTERM), the controller's blocking call returns
+// promptly and writes a terminal status to the store — instead of leaving
+// the job Pending until TTL expiry.
+func TestAcceptScanRequest_GoroutineRespectsScanCtx(t *testing.T) {
+	store := memory.NewStore()
+	scanCtx, cancelScans := context.WithCancel(context.Background())
+	defer cancelScans()
+	var scanWG sync.WaitGroup
+
+	bc := &blockingController{started: make(chan struct{}), store: store}
+
+	handler := NewAPIHandler(
+		config.BuildInfo{Version: "test"},
+		config.Config{},
+		store,
+		bc,
+		scanCtx,
+		&scanWG,
+	)
+
+	body, _ := json.Marshal(harbor.ScanRequest{
+		Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+		Artifact: harbor.Artifact{Repository: "library/nginx", Digest: "sha256:abc"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/scan", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var scanResp harbor.ScanResponse
+	if err := json.NewDecoder(w.Body).Decode(&scanResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// Wait for the goroutine to actually enter Scan(). If the handler
+	// detached the context, ctx.Done would never fire and the test would
+	// time out.
+	select {
+	case <-bc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller.Scan was not invoked within 2s")
+	}
+
+	// Now simulate SIGTERM: cancel the parent. The goroutine should exit
+	// promptly and decrement scanWG.
+	cancelScans()
+
+	done := make(chan struct{})
+	go func() { scanWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scanWG did not drain within 2s; goroutine may be using a detached context")
+	}
+
+	if bc.gotCtxErr == nil {
+		t.Errorf("expected goroutine to observe ctx.Err on cancellation, got nil")
+	}
+
+	// Job should be Failed with the interruption message — not stuck Pending.
+	got, err := store.Get(context.Background(), scanResp.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("job missing from store")
+	}
+	if got.Status != persistence.Failed {
+		t.Errorf("expected status Failed, got %s", got.Status)
+	}
+	if got.Error == "" {
+		t.Errorf("expected job.Error to describe the interruption")
+	}
+}
+
 // TestReady_AllChecksPass confirms the all-pass path returns 200 and lists
 // each successful check by name.
 func TestReady_AllChecksPass(t *testing.T) {
 	handler := NewAPIHandler(
 		config.BuildInfo{}, config.Config{}, memory.NewStore(), nil,
+		nil, nil, // scanCtx, scanWG
 		ReadinessCheck{Name: "first", Check: func() error { return nil }},
 		ReadinessCheck{Name: "second", Check: func() error { return nil }},
 	)
