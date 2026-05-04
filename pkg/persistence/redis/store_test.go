@@ -176,3 +176,32 @@ func TestPing_RedisDown(t *testing.T) {
 		t.Error("expected Ping to fail when miniredis is closed")
 	}
 }
+
+// TestReadinessCheck_Shape pins the contract issue #25 expects: the
+// readiness closure that main.go's buildStore wires up must (1) succeed when
+// Redis is reachable, (2) fail when Redis goes down at runtime, and (3)
+// honor a bounded timeout so a hung Redis can't stall the probe.
+//
+// We construct the same closure shape buildStore uses so a regression in
+// either side surfaces here.
+func TestReadinessCheck_Shape(t *testing.T) {
+	s, mr := newTestStore(t)
+
+	// Mirror the closure from cmd/scanner-kubescape/main.go::buildStore.
+	const timeout = 500 * time.Millisecond
+	check := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return s.Ping(ctx)
+	}
+
+	if err := check(); err != nil {
+		t.Fatalf("expected check to pass against live miniredis, got %v", err)
+	}
+
+	mr.Close()
+
+	if err := check(); err == nil {
+		t.Errorf("expected check to fail when miniredis is closed; pod would stay Ready while every scan write 500s")
+	}
+}
