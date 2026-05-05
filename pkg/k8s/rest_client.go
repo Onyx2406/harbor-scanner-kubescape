@@ -203,12 +203,14 @@ func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, na
 		}
 		return nil, fmt.Errorf("%w: K8s API 404 not for the requested object (likely missing namespace, unserved resource type, or broken path): %s", ErrFatalAPIRead, string(body))
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// Auth failure won't recover within a single scan. Token rotation
-		// is picked up on the next request, so a transient 401 right at
-		// rotation boundary would flap at most once — but in steady state
-		// 401/403 means RBAC / token misconfig, and retrying for the
-		// full pollTimeout is a waste of budget.
+	// Any other 4xx is treated as fatal: 405 Method Not Allowed, 410
+	// Gone (resource type retired), 422 Unprocessable Entity, etc. These
+	// are deterministic client/cluster-config failures that don't fix
+	// themselves on retry. Pre-fix only 401/403 were classified as
+	// fatal, so a 410 from a retired CRD still got retried for the full
+	// pollTimeout (issue #45). 5xx and network errors stay transient
+	// — the retry loop will catch a server hiccup.
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		return nil, fmt.Errorf("%w: K8s API rejected GET (HTTP %d): %s", ErrFatalAPIRead, resp.StatusCode, string(body))
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -312,12 +314,12 @@ func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
 
 	body, _ := readBodyCapped(resp.Body)
 
-	switch resp.StatusCode {
-	case http.StatusOK:
+	switch {
+	case resp.StatusCode == http.StatusOK:
 		// Probe CRD exists by that name (extremely unlikely with our
 		// chosen name, but means we have read access — healthy).
 		return nil
-	case http.StatusNotFound:
+	case resp.StatusCode == http.StatusNotFound:
 		// Healthy ONLY when the 404 is the specific "probe object not
 		// found" Status. A 404 for a missing namespace or an unserved
 		// resource type would falsely keep readiness green even though
@@ -326,8 +328,11 @@ func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
 			return nil
 		}
 		return fmt.Errorf("%w: k8s API 404 not for the probe object (likely missing namespace, unserved resource type, or broken path): %s", ErrFatalAPIRead, string(body))
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("%w: k8s API rejected VulnerabilityManifest GET (HTTP %d) — likely token rotation not picked up or RBAC missing", ErrFatalAPIRead, resp.StatusCode)
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		// Any other 4xx (401/403/405/410/422/...) is a deterministic
+		// client/cluster-config failure that won't recover by retrying.
+		// Mark fatal so the controller can short-circuit. See #45.
+		return fmt.Errorf("%w: k8s API rejected VulnerabilityManifest GET (HTTP %d) — token rotation, RBAC, or resource-type misconfig: %s", ErrFatalAPIRead, resp.StatusCode, string(body))
 	default:
 		return fmt.Errorf("k8s API ping returned %d: %s", resp.StatusCode, string(body))
 	}

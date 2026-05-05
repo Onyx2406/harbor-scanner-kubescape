@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -661,5 +662,86 @@ func TestListVulnerabilityManifests_AppliesCweOverlay(t *testing.T) {
 	want = []string{"CWE-200"}
 	if !equalStrings(got, want) {
 		t.Errorf("second manifest CweIDs = %v, want %v", got, want)
+	}
+}
+
+// TestGet_4xx_IsFatal pins issue #45: any 4xx response (not just
+// 401/403/non-object-404) wraps ErrFatalAPIRead so the controller can
+// short-circuit instead of retrying for the full pollTimeout. 405, 410,
+// 422 are the realistic ones — a CRD type that's been retired returns
+// 410 Gone, a misrouted request can return 405 Method Not Allowed.
+func TestGet_4xx_IsFatal(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+	}{
+		{"405 Method Not Allowed", http.StatusMethodNotAllowed},
+		{"410 Gone (resource type retired)", http.StatusGone},
+		{"422 Unprocessable Entity", http.StatusUnprocessableEntity},
+		{"401 Unauthorized (regression)", http.StatusUnauthorized},
+		{"403 Forbidden (regression)", http.StatusForbidden},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.code)
+			}))
+			defer srv.Close()
+
+			c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+			_, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "any-name")
+			if err == nil {
+				t.Fatalf("expected error for HTTP %d, got nil", tc.code)
+			}
+			if !errors.Is(err, ErrFatalAPIRead) {
+				t.Errorf("HTTP %d should wrap ErrFatalAPIRead so the poll loop bails fast, got plain error: %v", tc.code, err)
+			}
+		})
+	}
+}
+
+// TestGet_5xx_IsTransient confirms server errors stay UNwrapped so the
+// poll loop continues retrying. A 503 from a momentarily overloaded
+// apiserver shouldn't fail the scan.
+func TestGet_5xx_IsTransient(t *testing.T) {
+	for _, code := range []int{500, 502, 503, 504} {
+		t.Run(fmt.Sprintf("HTTP %d", code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+			_, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "any-name")
+			if err == nil {
+				t.Fatalf("expected error for HTTP %d, got nil", code)
+			}
+			if errors.Is(err, ErrFatalAPIRead) {
+				t.Errorf("HTTP %d must NOT wrap ErrFatalAPIRead — 5xx is transient and the poll loop should retry, not bail", code)
+			}
+		})
+	}
+}
+
+// TestPing_4xx_IsFatal mirrors TestGet_4xx_IsFatal for the readiness
+// probe path: any 4xx response should mark the pod NotReady.
+func TestPing_4xx_IsFatal(t *testing.T) {
+	for _, code := range []int{405, 410, 422} {
+		t.Run(fmt.Sprintf("HTTP %d", code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+			err := c.Ping(context.Background(), "kubescape")
+			if err == nil {
+				t.Fatalf("expected Ping to fail on HTTP %d", code)
+			}
+			if !errors.Is(err, ErrFatalAPIRead) {
+				t.Errorf("Ping HTTP %d should wrap ErrFatalAPIRead, got plain error: %v", code, err)
+			}
+		})
 	}
 }
