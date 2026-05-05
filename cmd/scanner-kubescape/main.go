@@ -110,12 +110,11 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 	//     runtime takes the pod out of rotation. See issue #25.
 	readiness := []v1.ReadinessCheck{
 		{
-			// Authenticated kubernetes-client check (issue #30).
-			// Pre-#30 this was a nil check, which silently stayed green
-			// after a token rotation 401 — the pod looked Ready while
-			// every scan returned 500. Now we hit /version on each probe
-			// with the freshest token, so 401/403/network errors take
-			// the pod NotReady.
+			// Authenticated VulnerabilityManifest-access check (issues
+			// #16, #30, #35). Hits the same resource type and namespace
+			// the scan path uses, so probe success is direct evidence
+			// the adapter can actually serve. 401/403/network errors
+			// take the pod NotReady; 200/404 keep it Ready.
 			Name: "kubernetes-client",
 			Check: func() error {
 				if k8sClient == nil {
@@ -123,7 +122,7 @@ func run(ctx context.Context, cfg config.Config, buildInfo config.BuildInfo) err
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), readinessCheckTimeout)
 				defer cancel()
-				return k8sClient.Ping(ctx)
+				return k8sClient.Ping(ctx, cfg.Kubevuln.Namespace)
 			},
 		},
 	}
