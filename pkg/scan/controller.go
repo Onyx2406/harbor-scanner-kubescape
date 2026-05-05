@@ -152,8 +152,19 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		if errors.Is(err, k8s.ErrFatalAPIRead) {
 			return fmt.Errorf("aborting scan on unrecoverable K8s API error: %w", err)
 		}
-		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
+		// Transient init error: we don't know whether a pre-existing
+		// (stale) CRD is sitting in the cluster. Without a freshness
+		// floor, the very first poll tick after our rescan would
+		// happily return that stale object — defeating the guard the
+		// successful-init path establishes via existing.CreatedAt.
+		// Use now()-1s as the floor: well below any post-trigger CRD
+		// kubevuln will write, and well above any genuinely stale CRD
+		// (which is by definition older than our reuseTTL window).
+		// See issue #46.
+		staleSeenAt = now().Add(-1 * time.Second)
+		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan with conservative freshness floor",
 			slog.String("err", err.Error()),
+			slog.Time("freshness_floor", staleSeenAt),
 		)
 	} else if existing != nil && c.canReuse(existing) {
 		slog.Info("Found fresh VulnerabilityManifest, reusing results",

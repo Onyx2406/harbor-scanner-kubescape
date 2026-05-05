@@ -573,3 +573,113 @@ func TestPollForResults_FatalAPIError_Aborts(t *testing.T) {
 		t.Errorf("fakeK8s.calls = %d, want ≤3 — poll loop kept retrying despite fatal error", fakeK8s.calls)
 	}
 }
+
+// transientThenStaleClient simulates a transient init failure followed by
+// the pre-existing stale CRD coming back on subsequent polls, then the
+// fresh post-rescan CRD. Pre-fix the freshness gate was wide open in
+// this scenario — staleSeenAt stayed zero on init error and the first
+// stale-returning poll tick was accepted.
+type transientThenStaleClient struct {
+	calls   int
+	stale   *k8s.VulnerabilityManifest
+	fresh   *k8s.VulnerabilityManifest
+	freshOn int // call number at which to start returning fresh
+	failOn  int // call number that errors transiently (typically 1)
+}
+
+func (c *transientThenStaleClient) GetVulnerabilityManifest(_ context.Context, _, _ string) (*k8s.VulnerabilityManifest, error) {
+	c.calls++
+	if c.calls == c.failOn {
+		return nil, fmt.Errorf("transient k8s error: i/o timeout")
+	}
+	if c.calls >= c.freshOn {
+		return c.fresh, nil
+	}
+	return c.stale, nil
+}
+
+func (c *transientThenStaleClient) ListVulnerabilityManifests(_ context.Context, _, _ string) ([]k8s.VulnerabilityManifest, error) {
+	return nil, nil
+}
+
+func (c *transientThenStaleClient) Ping(_ context.Context, _ string) error { return nil }
+
+// TestScan_TransientInitError_StaleGuardStillHolds pins issue #46.
+//
+// Pre-fix: when the initial CRD lookup errored transiently, staleSeenAt
+// stayed zero. The poll loop's freshness gate was therefore wide open,
+// and the very first poll tick that successfully returned the
+// pre-existing stale CRD would accept it as the "fresh rescan result."
+// Harbor would then receive outdated vulnerability data despite our
+// rescan kickoff.
+//
+// Post-fix: the transient init error sets staleSeenAt to a conservative
+// "now() - 1s" floor, so any pre-existing CRD (which has a CreatedAt in
+// the past) is rejected by the gate. Only a CRD created strictly after
+// the trigger — i.e. the actual rescan output — passes.
+func TestScan_TransientInitError_StaleGuardStillHolds(t *testing.T) {
+	fixedNow := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+	now = func() time.Time { return fixedNow }
+	t.Cleanup(func() { now = time.Now })
+
+	pollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { pollInterval = 5 * time.Second })
+
+	staleCRD := &k8s.VulnerabilityManifest{
+		Name:      "nginx-stale",
+		CreatedAt: fixedNow.Add(-30 * 24 * time.Hour), // a month old
+		Matches:   []k8s.VulnMatch{{ID: "CVE-2024-OLD", Severity: "Low"}},
+	}
+	freshCRD := &k8s.VulnerabilityManifest{
+		Name:      "nginx-fresh",
+		CreatedAt: fixedNow.Add(1 * time.Second), // post-trigger
+		Matches: []k8s.VulnMatch{
+			{ID: "CVE-2024-NEW", Severity: "Critical"},
+		},
+	}
+
+	fakeK8s := &transientThenStaleClient{
+		stale:   staleCRD,
+		fresh:   freshCRD,
+		failOn:  1, // initial Get errors transiently
+		freshOn: 5, // by the 5th call kubevuln has overwritten
+	}
+
+	store := memory.NewStore()
+	ctx := context.Background()
+
+	job := persistence.ScanJob{
+		ID: "job-transient-init",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	c := NewController(store, &fakeScanner{}, fakeK8s, "kubescape", DefaultReuseTTL)
+	if err := c.Scan(ctx, job.ID); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	got, _ := store.Get(ctx, job.ID)
+	if got.Status != persistence.Finished {
+		t.Fatalf("expected Finished, got %s (job.Error=%q)", got.Status, got.Error)
+	}
+	if len(got.Report.Vulnerabilities) != 1 {
+		t.Fatalf("expected 1 vulnerability, got %d", len(got.Report.Vulnerabilities))
+	}
+	// Headline assertion: the report contains CVE-2024-NEW (the
+	// post-trigger fresh CRD), NOT CVE-2024-OLD (the stale one that
+	// pre-existed and would have been accepted under the pre-fix code).
+	if got.Report.Vulnerabilities[0].ID != "CVE-2024-NEW" {
+		t.Errorf("report contains stale data: got %q, want CVE-2024-NEW. The transient-init-error path leaked the stale CRD through the freshness guard (issue #46 regression).",
+			got.Report.Vulnerabilities[0].ID)
+	}
+}
