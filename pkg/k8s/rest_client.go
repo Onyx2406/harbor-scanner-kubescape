@@ -256,6 +256,7 @@ func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, 
 	if err != nil {
 		return nil, fmt.Errorf("reading VulnerabilityManifest list: %w", err)
 	}
+
 	var list v1beta1.VulnerabilityManifestList
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("decoding VulnerabilityManifest list: %w", err)
@@ -265,6 +266,12 @@ func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, 
 	for i := range list.Items {
 		result = append(result, *canonicalToManifest(&list.Items[i]))
 	}
+	// CWE overlay parity with Get: parse the same body again as a
+	// list-shaped overlay to capture cwes that the canonical v1beta1
+	// type doesn't yet carry, then merge by index. See issue #5; this
+	// just extends that fix to the List path so both API surfaces stay
+	// in sync.
+	applyCweOverlayList(body, result)
 	return result, nil
 }
 
@@ -420,12 +427,42 @@ func applyCweOverlay(body []byte, vm *VulnerabilityManifest) {
 	if err := json.Unmarshal(body, &overlay); err != nil {
 		return
 	}
-	n := len(overlay.Spec.Payload.Matches)
-	if n > len(vm.Matches) {
-		n = len(vm.Matches)
+	mergeCwes(overlay.Spec.Payload.Matches, vm.Matches)
+}
+
+// cweOverlayList mirrors a VulnerabilityManifestList response just for the
+// CWE fields. Same shape as cweOverlay but inside an items array.
+type cweOverlayList struct {
+	Items []cweOverlay `json:"items"`
+}
+
+// applyCweOverlayList is the List-path counterpart of applyCweOverlay.
+// Decodes the raw body once as a list-shaped overlay and merges CWEs
+// onto each manifest's Matches by index. Non-fatal on parse failure.
+func applyCweOverlayList(body []byte, manifests []VulnerabilityManifest) {
+	var overlay cweOverlayList
+	if err := json.Unmarshal(body, &overlay); err != nil {
+		return
+	}
+	n := len(overlay.Items)
+	if n > len(manifests) {
+		n = len(manifests)
 	}
 	for i := 0; i < n; i++ {
-		vm.Matches[i].CweIDs = unionCwes(overlay.Spec.Payload.Matches[i])
+		mergeCwes(overlay.Items[i].Spec.Payload.Matches, manifests[i].Matches)
+	}
+}
+
+// mergeCwes is the shared body of applyCweOverlay / applyCweOverlayList:
+// walk both slices by index and stamp the deduped CWE union onto each
+// VulnMatch.
+func mergeCwes(overlay []cweOverlayMatch, matches []VulnMatch) {
+	n := len(overlay)
+	if n > len(matches) {
+		n = len(matches)
+	}
+	for i := 0; i < n; i++ {
+		matches[i].CweIDs = unionCwes(overlay[i])
 	}
 }
 

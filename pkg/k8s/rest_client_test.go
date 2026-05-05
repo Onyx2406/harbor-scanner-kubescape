@@ -573,3 +573,93 @@ func TestPing_NamespaceNotFoundIsUnhealthy(t *testing.T) {
 		t.Fatal("expected Ping to fail when the namespace itself is missing; readiness must not stay green")
 	}
 }
+
+// TestListVulnerabilityManifests_AppliesCweOverlay pins parity with Get:
+// CWE IDs (which the canonical v1beta1 type doesn't carry) must also
+// surface from List responses. Pre-fix the List path skipped the overlay
+// entirely, so any future caller of List would silently miss CWEs even
+// though Get had them.
+func TestListVulnerabilityManifests_AppliesCweOverlay(t *testing.T) {
+	const listJSON = `{
+	  "apiVersion": "spdx.softwarecomposition.kubescape.io/v1beta1",
+	  "kind": "VulnerabilityManifestList",
+	  "metadata": {},
+	  "items": [
+	    {
+	      "metadata": {
+	        "name": "first",
+	        "namespace": "kubescape",
+	        "creationTimestamp": "2026-04-30T12:00:00Z"
+	      },
+	      "spec": {
+	        "metadata": {"tool":{"name":"grype","version":"0.74.0"}, "report":{"createdAt":"2026-04-30T12:00:00Z"}},
+	        "payload": {
+	          "matches": [
+	            {
+	              "vulnerability": {"id":"CVE-A","severity":"High","cwes":["CWE-79"]},
+	              "relatedVulnerabilities": [{"cwes":["CWE-89"]}],
+	              "artifact": {"name":"libfoo","version":"1.0"}
+	            }
+	          ]
+	        }
+	      }
+	    },
+	    {
+	      "metadata": {
+	        "name": "second",
+	        "namespace": "kubescape",
+	        "creationTimestamp": "2026-04-30T12:00:00Z"
+	      },
+	      "spec": {
+	        "metadata": {"tool":{"name":"grype","version":"0.74.0"}, "report":{"createdAt":"2026-04-30T12:00:00Z"}},
+	        "payload": {
+	          "matches": [
+	            {
+	              "vulnerability": {"id":"CVE-B","severity":"Low"},
+	              "relatedVulnerabilities": [{"cwes":["CWE-200"]}],
+	              "artifact": {"name":"libbar","version":"2.0"}
+	            }
+	          ]
+	        }
+	      }
+	    }
+	  ]
+	}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(listJSON))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	manifests, err := c.ListVulnerabilityManifests(context.Background(), "kubescape", "")
+	if err != nil {
+		t.Fatalf("ListVulnerabilityManifests: %v", err)
+	}
+	if len(manifests) != 2 {
+		t.Fatalf("expected 2 manifests, got %d", len(manifests))
+	}
+
+	// First manifest: CWEs from both vulnerability.cwes and
+	// relatedVulnerabilities.cwes, deduplicated and ordered first-seen.
+	if len(manifests[0].Matches) != 1 {
+		t.Fatalf("first manifest: expected 1 match, got %d", len(manifests[0].Matches))
+	}
+	got := manifests[0].Matches[0].CweIDs
+	want := []string{"CWE-79", "CWE-89"}
+	if !equalStrings(got, want) {
+		t.Errorf("first manifest CweIDs = %v, want %v (List path missed the CWE overlay)", got, want)
+	}
+
+	// Second manifest: CWE only on related — must still propagate.
+	if len(manifests[1].Matches) != 1 {
+		t.Fatalf("second manifest: expected 1 match, got %d", len(manifests[1].Matches))
+	}
+	got = manifests[1].Matches[0].CweIDs
+	want = []string{"CWE-200"}
+	if !equalStrings(got, want) {
+		t.Errorf("second manifest CweIDs = %v, want %v", got, want)
+	}
+}
