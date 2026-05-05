@@ -130,6 +130,57 @@ func TestTransformManifestToReport_Empty(t *testing.T) {
 	if report.Vulnerabilities == nil {
 		t.Error("expected non-nil vulnerabilities slice for JSON serialization")
 	}
+	// Clean image must report Negligible — pre-fix it stayed at the zero
+	// value and serialized as "Unknown" via the Severity.MarshalJSON
+	// fallback, which is misleading for a scanned-and-clean image.
+	if report.Severity != harbor.SevNegligible {
+		t.Errorf("clean image severity = %s, want Negligible (zero/Unknown was the pre-fix bug)", report.Severity)
+	}
+}
+
+// TestTransformManifestToReport_PicksHighestCVSS pins the CVSS-multi-entry
+// behavior: when Grype emits multiple v3 entries (NVD + vendor + RedHat),
+// the transformer must pick the HIGHEST score, not the last one in the
+// slice. Pre-fix the loop overwrote unconditionally and the answer
+// depended on emission order.
+func TestTransformManifestToReport_PicksHighestCVSS(t *testing.T) {
+	vm := &k8s.VulnerabilityManifest{
+		Name:      "test",
+		CreatedAt: time.Now(),
+		Matches: []k8s.VulnMatch{{
+			ID:       "CVE-2024-9999",
+			Severity: "High",
+			PkgName:  "libfoo",
+			CVSS: []k8s.VulnCVSS{
+				// Lowest first, highest in the middle, then a lower one.
+				// Pre-fix the last (3.5) would have won; post-fix the 9.8 wins.
+				{Version: "3.1", Vector: "CVSS:3.1/AV:N", BaseScore: 5.5},
+				{Version: "3.1", Vector: "CVSS:3.1/AV:L", BaseScore: 9.8},
+				{Version: "3.1", Vector: "CVSS:3.1/AV:N", BaseScore: 3.5},
+				// Same pattern for v2.
+				{Version: "2.0", Vector: "AV:N/AC:L", BaseScore: 4.0},
+				{Version: "2.0", Vector: "AV:L/AC:H", BaseScore: 8.5},
+			},
+		}},
+	}
+
+	report := TransformManifestToReport(vm, harbor.Artifact{})
+	if len(report.Vulnerabilities) != 1 {
+		t.Fatalf("expected 1 vulnerability, got %d", len(report.Vulnerabilities))
+	}
+	cvss := report.Vulnerabilities[0].CVSS
+	if cvss == nil {
+		t.Fatal("expected CVSS details, got nil")
+	}
+	if cvss.ScoreV3 == nil || *cvss.ScoreV3 != 9.8 {
+		t.Errorf("ScoreV3 = %v, want 9.8 (highest)", cvss.ScoreV3)
+	}
+	if cvss.VectorV3 != "CVSS:3.1/AV:L" {
+		t.Errorf("VectorV3 = %q, want vector for the 9.8 score", cvss.VectorV3)
+	}
+	if cvss.ScoreV2 == nil || *cvss.ScoreV2 != 8.5 {
+		t.Errorf("ScoreV2 = %v, want 8.5 (highest)", cvss.ScoreV2)
+	}
 }
 
 func equalStrings(a, b []string) bool {
