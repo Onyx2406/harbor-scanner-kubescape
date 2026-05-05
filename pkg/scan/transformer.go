@@ -42,17 +42,25 @@ func TransformManifestToReport(vm *k8s.VulnerabilityManifest, artifact harbor.Ar
 			CweIDs:      m.CweIDs,
 		}
 
-		// Map CVSS if available
+		// Map CVSS — pick the HIGHEST base score per version. Grype can
+		// emit multiple CVSS entries (NVD + vendor + RedHat) for the
+		// same CVE; the previous "last entry wins" was deterministic
+		// but order-dependent and could quietly understate severity if
+		// the vendor's score happened to come last. Prefer worst-case.
 		if len(m.CVSS) > 0 {
 			cvss := &harbor.CVSSDetails{}
 			for _, c := range m.CVSS {
 				score := float32(c.BaseScore)
 				if strings.HasPrefix(c.Version, "3") {
-					cvss.ScoreV3 = &score
-					cvss.VectorV3 = c.Vector
+					if cvss.ScoreV3 == nil || score > *cvss.ScoreV3 {
+						cvss.ScoreV3 = &score
+						cvss.VectorV3 = c.Vector
+					}
 				} else if strings.HasPrefix(c.Version, "2") {
-					cvss.ScoreV2 = &score
-					cvss.VectorV2 = c.Vector
+					if cvss.ScoreV2 == nil || score > *cvss.ScoreV2 {
+						cvss.ScoreV2 = &score
+						cvss.VectorV2 = c.Vector
+					}
 				}
 			}
 			item.CVSS = cvss
@@ -61,11 +69,18 @@ func TransformManifestToReport(vm *k8s.VulnerabilityManifest, artifact harbor.Ar
 		report.Vulnerabilities = append(report.Vulnerabilities, item)
 	}
 
-	report.Severity = highestSeverity
-
-	// Ensure non-nil slice for JSON serialization
-	if report.Vulnerabilities == nil {
+	// Overall severity. Two cases:
+	//   * non-empty manifest → highest severity across matches
+	//   * empty manifest     → SevNegligible. Pre-fix this stayed at the
+	//     zero value, which the Severity.MarshalJSON fallback emits as
+	//     "Unknown" — confusing for a clean image. Negligible is the
+	//     lowest enum the Harbor scanner spec recognises and accurately
+	//     conveys "scanned, nothing noteworthy."
+	if len(report.Vulnerabilities) == 0 {
+		report.Severity = harbor.SevNegligible
 		report.Vulnerabilities = []harbor.VulnerabilityItem{}
+	} else {
+		report.Severity = highestSeverity
 	}
 
 	return report
