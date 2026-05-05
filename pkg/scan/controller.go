@@ -2,6 +2,7 @@ package scan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -144,6 +145,13 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	var staleSeenAt time.Time
 
 	if err != nil {
+		// Bail fast on unrecoverable errors (auth rejection, missing
+		// namespace, unserved resource type). Triggering a kubevuln
+		// scan we can't observe would just burn the pollTimeout
+		// budget for nothing.
+		if errors.Is(err, k8s.ErrFatalAPIRead) {
+			return fmt.Errorf("aborting scan on unrecoverable K8s API error: %w", err)
+		}
 		slog.Warn("Failed to check existing VulnerabilityManifest, will trigger new scan",
 			slog.String("err", err.Error()),
 		)
@@ -237,7 +245,14 @@ func (c *controller) pollForResults(ctx context.Context, crdName string, artifac
 
 			vm, err := c.k8sClient.GetVulnerabilityManifest(ctx, c.namespace, crdName)
 			if err != nil {
-				slog.Warn("Error polling VulnerabilityManifest",
+				// Unrecoverable errors (auth rejection, missing namespace,
+				// broken resource path) won't fix themselves. Bail
+				// immediately instead of burning the rest of pollTimeout
+				// retrying against a misconfigured cluster.
+				if errors.Is(err, k8s.ErrFatalAPIRead) {
+					return harbor.ScanReport{}, fmt.Errorf("aborting poll on unrecoverable K8s API error: %w", err)
+				}
+				slog.Warn("Error polling VulnerabilityManifest (transient, will retry)",
 					slog.String("crd_name", crdName),
 					slog.String("err", err.Error()),
 				)

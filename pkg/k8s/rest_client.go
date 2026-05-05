@@ -170,11 +170,22 @@ func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, na
 		// resource path, or a broken aggregator must surface as an error
 		// — otherwise GetVulnerabilityManifest silently returns "no scan
 		// result yet" and the controller polls until timeout instead of
-		// failing fast. See issue #37.
+		// failing fast. See issue #37. The non-benign branch is wrapped
+		// with ErrFatalAPIRead so the poll loop can short-circuit
+		// instead of retrying for 10 minutes against a misconfigured
+		// cluster.
 		if isNamedObjectNotFound(body, resource, name) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("K8s API 404 not for the requested object (likely missing namespace, unserved resource type, or broken path): %s", string(body))
+		return nil, fmt.Errorf("%w: K8s API 404 not for the requested object (likely missing namespace, unserved resource type, or broken path): %s", ErrFatalAPIRead, string(body))
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Auth failure won't recover within a single scan. Token rotation
+		// is picked up on the next request, so a transient 401 right at
+		// rotation boundary would flap at most once — but in steady state
+		// 401/403 means RBAC / token misconfig, and retrying for the
+		// full pollTimeout is a waste of budget.
+		return nil, fmt.Errorf("%w: K8s API rejected GET (HTTP %d): %s", ErrFatalAPIRead, resp.StatusCode, string(body))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
@@ -279,9 +290,9 @@ func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
 		if isNamedObjectNotFound(body, resource, readinessProbeName) {
 			return nil
 		}
-		return fmt.Errorf("k8s API 404 not for the probe object (likely missing namespace, unserved resource type, or broken path): %s", string(body))
+		return fmt.Errorf("%w: k8s API 404 not for the probe object (likely missing namespace, unserved resource type, or broken path): %s", ErrFatalAPIRead, string(body))
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("k8s API rejected VulnerabilityManifest GET (HTTP %d) — likely token rotation not picked up or RBAC missing", resp.StatusCode)
+		return fmt.Errorf("%w: k8s API rejected VulnerabilityManifest GET (HTTP %d) — likely token rotation not picked up or RBAC missing", ErrFatalAPIRead, resp.StatusCode)
 	default:
 		return fmt.Errorf("k8s API ping returned %d: %s", resp.StatusCode, string(body))
 	}

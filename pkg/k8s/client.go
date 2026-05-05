@@ -2,10 +2,22 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrFatalAPIRead indicates a Kubernetes API failure that won't recover by
+// retrying within a single scan: token rejected (401/403), or a 404 that
+// names something other than the requested object (missing namespace,
+// unserved resource type, broken aggregator). Callers — most importantly
+// the scan controller's poll loop — should short-circuit on this rather
+// than burn the full pollTimeout retrying. Network blips and 5xx are NOT
+// fatal; those keep retrying.
+//
+// Use errors.Is(err, k8s.ErrFatalAPIRead) to detect.
+var ErrFatalAPIRead = errors.New("kubernetes API read is unrecoverable without operator action")
 
 // VulnerabilityManifest is a transformer-friendly projection of the
 // kubescape/storage v1beta1.VulnerabilityManifest CRD. The REST client

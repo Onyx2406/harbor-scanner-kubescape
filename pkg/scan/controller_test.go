@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -477,5 +478,98 @@ func TestScan_RedisFailedWrite_UsesUncancelledCtx(t *testing.T) {
 	}
 	if got.Error == "" {
 		t.Errorf("expected job.Error to be populated, got empty string")
+	}
+}
+
+// fatalErrK8sClient simulates a K8s client that always returns
+// k8s.ErrFatalAPIRead — e.g. a cluster where RBAC is misconfigured or
+// the namespace is wrong.
+type fatalErrK8sClient struct {
+	calls int
+}
+
+func (f *fatalErrK8sClient) GetVulnerabilityManifest(_ context.Context, _, _ string) (*k8s.VulnerabilityManifest, error) {
+	f.calls++
+	return nil, fmt.Errorf("test: %w", k8s.ErrFatalAPIRead)
+}
+
+func (f *fatalErrK8sClient) ListVulnerabilityManifests(_ context.Context, _, _ string) ([]k8s.VulnerabilityManifest, error) {
+	return nil, nil
+}
+
+func (f *fatalErrK8sClient) Ping(_ context.Context, _ string) error { return nil }
+
+// TestScan_FatalAPIError_BailsImmediately pins the fail-fast contract on
+// k8s.ErrFatalAPIRead: when the initial CRD check returns an unrecoverable
+// error (auth rejection, missing namespace, broken path), the controller
+// must NOT trigger a kubevuln scan and then poll for 10 minutes against
+// a cluster that will never produce a result. It must record Failed
+// status immediately.
+func TestScan_FatalAPIError_BailsImmediately(t *testing.T) {
+	store := memory.NewStore()
+	ctx := context.Background()
+
+	job := persistence.ScanJob{
+		ID: "job-fatal-init",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fakeK8s := &fatalErrK8sClient{}
+	scanner := &fakeScanner{}
+
+	c := NewController(store, scanner, fakeK8s, "kubescape", DefaultReuseTTL)
+	err := c.Scan(ctx, job.ID)
+	if err == nil {
+		t.Fatal("expected Scan to fail with the fatal API error, got nil")
+	}
+	if !errors.Is(err, k8s.ErrFatalAPIRead) {
+		t.Errorf("expected error to wrap k8s.ErrFatalAPIRead, got %v", err)
+	}
+
+	// Critically, scanner.TriggerScan must NOT have been called: we should
+	// have bailed before kicking off a kubevuln scan we can't observe.
+	if scanner.triggers != 0 {
+		t.Errorf("scanner.triggers = %d, want 0 — controller must bail before triggering kubevuln on fatal API error", scanner.triggers)
+	}
+
+	got, _ := store.Get(ctx, job.ID)
+	if got.Status != persistence.Failed {
+		t.Errorf("expected status Failed, got %s", got.Status)
+	}
+}
+
+// TestPollForResults_FatalAPIError_Aborts pins the same fail-fast contract
+// for the poll path: if the K8s client starts returning a fatal API error
+// during polling (e.g. RBAC revoked mid-scan), the loop must abort
+// immediately rather than spam the API for the full pollTimeout.
+func TestPollForResults_FatalAPIError_Aborts(t *testing.T) {
+	pollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { pollInterval = 5 * time.Second })
+
+	fakeK8s := &fatalErrK8sClient{}
+	c := &controller{k8sClient: fakeK8s, namespace: "kubescape"}
+
+	_, err := c.pollForResults(context.Background(), "any-name", harbor.Artifact{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected pollForResults to error, got nil")
+	}
+	if !errors.Is(err, k8s.ErrFatalAPIRead) {
+		t.Errorf("expected error to wrap k8s.ErrFatalAPIRead, got %v", err)
+	}
+	// Should have bailed within a few ticks, NOT looped for the full
+	// pollTimeout. The fakeK8sClient counts; one or two calls is fine,
+	// dozens means the abort path didn't fire.
+	if fakeK8s.calls > 3 {
+		t.Errorf("fakeK8s.calls = %d, want ≤3 — poll loop kept retrying despite fatal error", fakeK8s.calls)
 	}
 }
