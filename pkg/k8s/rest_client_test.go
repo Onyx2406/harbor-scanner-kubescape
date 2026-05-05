@@ -286,7 +286,7 @@ func TestFileTokenSource_RereadsOnEveryCall(t *testing.T) {
 
 	c := NewRESTClient(srv.URL, FileTokenSource(tokenPath))
 
-	if err := c.Ping(context.Background()); err != nil {
+	if err := c.Ping(context.Background(), "kubescape"); err != nil {
 		t.Fatalf("Ping #1: %v", err)
 	}
 	if got := seenAuth.Load().(string); got != "Bearer token-v1" {
@@ -298,7 +298,7 @@ func TestFileTokenSource_RereadsOnEveryCall(t *testing.T) {
 		t.Fatalf("rotate token: %v", err)
 	}
 
-	if err := c.Ping(context.Background()); err != nil {
+	if err := c.Ping(context.Background(), "kubescape"); err != nil {
 		t.Fatalf("Ping #2: %v", err)
 	}
 	if got := seenAuth.Load().(string); got != "Bearer token-v2" {
@@ -317,7 +317,7 @@ func TestPing_SurfacesAuthFailure(t *testing.T) {
 
 	c := NewRESTClient(srv.URL, StaticTokenSource("expired"))
 
-	err := c.Ping(context.Background())
+	err := c.Ping(context.Background(), "kubescape")
 	if err == nil {
 		t.Fatal("expected Ping to fail when API returns 401")
 	}
@@ -336,7 +336,7 @@ func TestPing_OK(t *testing.T) {
 	defer srv.Close()
 
 	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
-	if err := c.Ping(context.Background()); err != nil {
+	if err := c.Ping(context.Background(), "kubescape"); err != nil {
 		t.Errorf("Ping should succeed, got %v", err)
 	}
 }
@@ -348,5 +348,81 @@ func TestFileTokenSource_MissingFile(t *testing.T) {
 	src := FileTokenSource("/nonexistent/no/such/path")
 	if _, err := src(); err == nil {
 		t.Error("expected error reading missing token file")
+	}
+}
+
+// TestPing_NotFoundIsHealthy pins the headline behavior of issue #35: a
+// 404 on the probe CRD must be treated as healthy. That's the *expected*
+// response — the probe name is intentionally invented, so 404 is exactly
+// what proves we have read access on the resource type. Pre-#35 the probe
+// was /version and a 404 there would not have happened; under the new
+// CRD probe, anything but 200/404 must mean trouble.
+func TestPing_NotFoundIsHealthy(t *testing.T) {
+	var seenPath atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+	if err := c.Ping(context.Background(), "kubescape"); err != nil {
+		t.Errorf("Ping should treat 404 on the probe CRD as healthy, got %v", err)
+	}
+
+	// Verify the probe actually hits the VulnerabilityManifest path so a
+	// regression to /version (or anything else) surfaces here.
+	path, _ := seenPath.Load().(string)
+	if !strings.Contains(path, "/vulnerabilitymanifests/") {
+		t.Errorf("Ping URL = %q, want a path under /vulnerabilitymanifests/ — readiness must exercise the same RBAC the chart grants (issue #35)", path)
+	}
+	if !strings.Contains(path, "/namespaces/kubescape/") {
+		t.Errorf("Ping URL = %q, want the configured namespace `kubescape` to be in the path", path)
+	}
+	if strings.Contains(path, "/version") {
+		t.Errorf("Ping URL = %q, regressed to /version probe (issue #35)", path)
+	}
+}
+
+// TestPing_ForbiddenIsUnhealthy pins the other half of #35: 403 must trip
+// readiness even though /version on permissive clusters might have
+// returned 200 for an otherwise-broken pod.
+func TestPing_ForbiddenIsUnhealthy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("limited"))
+
+	err := c.Ping(context.Background(), "kubescape")
+	if err == nil {
+		t.Fatal("expected Ping to fail when probe CRD GET returns 403")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("expected error to mention 403, got %v", err)
+	}
+}
+
+// TestPing_ProbesVulnerabilityManifestPath confirms the probe URL shape on
+// the happy path too, so a regression that 200's any path won't slip past
+// review unnoticed.
+func TestPing_ProbesVulnerabilityManifestPath(t *testing.T) {
+	var seenPath atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+	if err := c.Ping(context.Background(), "myns"); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+
+	path, _ := seenPath.Load().(string)
+	wantPrefix := "/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/myns/vulnerabilitymanifests/"
+	if !strings.HasPrefix(path, wantPrefix) {
+		t.Errorf("Ping URL = %q, want prefix %q", path, wantPrefix)
 	}
 }

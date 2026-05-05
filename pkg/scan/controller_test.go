@@ -38,7 +38,7 @@ func (f *fakeK8sClient) ListVulnerabilityManifests(_ context.Context, _, _ strin
 	return nil, nil
 }
 
-func (f *fakeK8sClient) Ping(_ context.Context) error { return nil }
+func (f *fakeK8sClient) Ping(_ context.Context, _ string) error { return nil }
 
 // fakeScanner increments triggers on every call.
 type fakeScanner struct {

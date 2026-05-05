@@ -60,11 +60,21 @@ type Client interface {
 	// optionally filtered by label selector.
 	ListVulnerabilityManifests(ctx context.Context, namespace, labelSelector string) ([]VulnerabilityManifest, error)
 
-	// Ping verifies connectivity to the Kubernetes API and that the
-	// current bearer token is still valid. Used by the readiness probe so
-	// post-rotation auth failures take the pod out of rotation instead of
-	// only surfacing at scan time. See issue #30.
-	Ping(ctx context.Context) error
+	// Ping verifies that the adapter can actually read VulnerabilityManifest
+	// CRDs in the given namespace. Used by the readiness probe.
+	//
+	// The probe path matches the capability the adapter actually depends on
+	// for scan lookup — it issues GET on a guaranteed-missing
+	// VulnerabilityManifest, so a successful 404 is the strongest "yes I
+	// have access to this resource type" signal. /version (the previous
+	// probe path, #30) doesn't prove that: stricter clusters can 403 it
+	// even with valid CRD RBAC, while permissive clusters can 200 it
+	// without proving anything about the resource type the chart's RBAC
+	// only covers `vulnerabilitymanifests`. See issue #35.
+	//
+	// Implementations should treat 200 and 404 as healthy and 401/403 as
+	// unhealthy.
+	Ping(ctx context.Context, namespace string) error
 }
 
 const (

@@ -221,13 +221,27 @@ func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, 
 	return result, nil
 }
 
-// Ping verifies that the Kubernetes API is reachable AND the current bearer
-// token is accepted. Hits /version (a small cheap endpoint that requires
-// auth on most clusters; an authenticated 200 is the strongest signal we
-// can get without actually scanning a CRD). Used by /probe/ready so that
-// post-rotation auth failures move the pod out of rotation. See issue #30.
-func (c *RESTClient) Ping(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/version", nil)
+// readinessProbeName is GET-d by Ping on the configured namespace. The
+// name is intentionally weird so it doesn't collide with a real CRD that
+// kubevuln might write.
+const readinessProbeName = "harbor-scanner-readiness-probe-does-not-exist"
+
+// Ping verifies that the adapter can actually issue authenticated reads
+// against the VulnerabilityManifest resource type — the same capability
+// the scan path depends on. Issues GET on a guaranteed-missing CRD in
+// `namespace` and treats 200 or 404 as healthy: both prove we reached
+// the API server, the token was accepted, and we have read access on
+// vulnerabilitymanifests. 401/403 surface as errors so /probe/ready
+// flips the pod NotReady; other failures (5xx, network) likewise.
+//
+// See issue #35 — the previous /version-based probe was misaligned with
+// the chart's RBAC and could be both falsely-NotReady on stricter clusters
+// and falsely-Ready on permissive ones.
+func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
+	url := fmt.Sprintf("%s/apis/%s/%s/namespaces/%s/%s/%s",
+		c.baseURL, apiGroup, apiVersion, namespace, resource, readinessProbeName)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("creating ping request: %w", err)
 	}
@@ -242,16 +256,17 @@ func (c *RESTClient) Ping(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("k8s API rejected token (HTTP %d) — likely token rotation not picked up", resp.StatusCode)
-	}
-	if resp.StatusCode >= 500 {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNotFound:
+		// 200: probe CRD exists by that name (extremely unlikely)
+		// 404: doesn't exist; we still proved read access on the type
+		// Both signal the adapter can perform real scan lookups.
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("k8s API rejected VulnerabilityManifest GET (HTTP %d) — likely token rotation not picked up or RBAC missing", resp.StatusCode)
+	default:
 		return fmt.Errorf("k8s API ping returned %d", resp.StatusCode)
 	}
-	// 200 ideal; some restricted clusters return 403 for /version. Treat
-	// any 2xx/4xx-other-than-401/403 as healthy: we proved we can reach
-	// the API and authentication didn't bounce us.
-	return nil
 }
 
 // canonicalToManifest converts the kubescape/storage v1beta1 type into the
