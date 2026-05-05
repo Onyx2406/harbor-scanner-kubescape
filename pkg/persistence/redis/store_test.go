@@ -253,3 +253,47 @@ func TestSetFinished_NotFound(t *testing.T) {
 		t.Error("expected SetFinished on missing key to error")
 	}
 }
+
+// TestUpdateStatus_SetsTerminalAt pins parity with the memory backend:
+// when UpdateStatus moves a job to Finished or Failed, the timestamp
+// must be set. Pre-fix the Redis path skipped it, leaving terminal jobs
+// with zero TerminalAt — inconsistent with the documented contract on
+// ScanJob.TerminalAt and breaking any future reader that relies on it.
+func TestUpdateStatus_SetsTerminalAt(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	for _, st := range []persistence.ScanJobStatus{persistence.Finished, persistence.Failed} {
+		t.Run(st.String(), func(t *testing.T) {
+			id := "job-" + st.String()
+			if err := s.Create(ctx, persistence.ScanJob{ID: id, Status: persistence.Queued}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			before := time.Now()
+			if err := s.UpdateStatus(ctx, id, st); err != nil {
+				t.Fatalf("UpdateStatus: %v", err)
+			}
+			after := time.Now()
+
+			got, _ := s.Get(ctx, id)
+			if got.TerminalAt.IsZero() {
+				t.Errorf("%s: TerminalAt is zero, want non-zero", st)
+			}
+			if got.TerminalAt.Before(before) || got.TerminalAt.After(after) {
+				t.Errorf("%s: TerminalAt %v outside expected window [%v, %v]", st, got.TerminalAt, before, after)
+			}
+		})
+	}
+
+	// Non-terminal transitions must NOT set TerminalAt.
+	if err := s.Create(ctx, persistence.ScanJob{ID: "job-pending", Status: persistence.Queued}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.UpdateStatus(ctx, "job-pending", persistence.Pending); err != nil {
+		t.Fatalf("UpdateStatus Pending: %v", err)
+	}
+	got, _ := s.Get(ctx, "job-pending")
+	if !got.TerminalAt.IsZero() {
+		t.Errorf("Pending must not set TerminalAt, got %v", got.TerminalAt)
+	}
+}

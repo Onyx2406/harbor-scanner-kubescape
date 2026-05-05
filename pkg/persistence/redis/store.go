@@ -116,6 +116,15 @@ func (s *Store) UpdateStatus(ctx context.Context, id string, status persistence.
 	if len(errMsg) > 0 {
 		job.Error = errMsg[0]
 	}
+	// Mirror the memory store: stamp TerminalAt on terminal transitions
+	// so the documented ScanJob.TerminalAt contract holds across both
+	// backends. Redis itself uses EXPIRE for retention so this isn't
+	// load-bearing for storage today, but any future reader of the
+	// field (e.g. analytics, debug log, a future Stats endpoint) needs
+	// it populated regardless of backend.
+	if status == persistence.Finished || status == persistence.Failed {
+		job.TerminalAt = time.Now()
+	}
 	return s.save(ctx, job)
 }
 
