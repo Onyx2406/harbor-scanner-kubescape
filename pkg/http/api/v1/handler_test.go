@@ -171,6 +171,15 @@ func TestGetScanReport_Pending(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("expected 302, got %d", w.Code)
 	}
+	// Guard against resurrecting the bogus Refresh-After header. Harbor's
+	// scanner client polls on its own schedule and ignores it; the name
+	// isn't a real HTTP header anyway.
+	if got := w.Header().Get("Refresh-After"); got != "" {
+		t.Errorf("Refresh-After header should not be set, got %q", got)
+	}
+	if got := w.Header().Get("Location"); got == "" {
+		t.Errorf("Location header should still be set on 302, got empty")
+	}
 }
 
 func TestGetScanReport_Finished(t *testing.T) {
@@ -400,8 +409,11 @@ func TestAcceptScanRequest_GoroutineRespectsScanCtx(t *testing.T) {
 	}
 }
 
-// TestReady_AllChecksPass confirms the all-pass path returns 200 and lists
-// each successful check by name.
+// TestReady_AllChecksPass confirms the all-pass path returns 200, lists
+// each successful check by name, AND advertises Content-Type:
+// application/json. Pre-fix the success path called WriteHeader before
+// setting Content-Type, so the header was silently dropped — anything
+// that tried to parse the JSON body got text/plain.
 func TestReady_AllChecksPass(t *testing.T) {
 	handler := NewAPIHandler(
 		config.BuildInfo{}, config.Config{}, memory.NewStore(), nil,
@@ -416,5 +428,8 @@ func TestReady_AllChecksPass(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (header order regression)", got)
 	}
 }

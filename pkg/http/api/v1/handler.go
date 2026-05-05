@@ -236,13 +236,15 @@ func (h *requestHandler) GetScanReport(w http.ResponseWriter, r *http.Request) {
 
 	switch job.Status {
 	case persistence.Queued, persistence.Pending:
-		// Scan is still in progress - return 302 so Harbor retries
+		// Scan is still in progress - return 302 so Harbor retries.
+		// Harbor's scanner-spec client polls on its own schedule, so we
+		// don't need a Refresh hint; the prior `Refresh-After` header
+		// wasn't a real HTTP header anyway.
 		slog.Debug("Scan in progress",
 			slog.String("scan_job_id", scanJobID),
 			slog.String("status", job.Status.String()),
 		)
 		w.Header().Set("Location", r.URL.String())
-		w.Header().Set("Refresh-After", "5")
 		w.WriteHeader(http.StatusFound)
 		return
 
@@ -285,6 +287,7 @@ func (h *requestHandler) GetReady(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	if allOK {
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "checks": results})
@@ -292,7 +295,6 @@ func (h *requestHandler) GetReady(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	slog.Warn("Readiness check failed", slog.Any("checks", results))
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "checks": results})
 }
