@@ -140,6 +140,31 @@ func TestAcceptScanRequest_MissingFields(t *testing.T) {
 	}
 }
 
+// TestAcceptScanRequest_OversizeBody pins the bounded-body guard: a POST
+// with a body well over the cap must be rejected, not silently consume
+// all that memory before parsing.
+func TestAcceptScanRequest_OversizeBody(t *testing.T) {
+	store := memory.NewStore()
+	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
+
+	// 2 MiB of nonsense — twice the cap. Encoded as a JSON string so the
+	// decoder reads it as a single token before deciding it's not a valid
+	// ScanRequest. With the cap, MaxBytesReader cuts it short and the
+	// decode errors out at 400 BadRequest.
+	huge := bytes.Repeat([]byte("x"), maxScanRequestBodyBytes+maxScanRequestBodyBytes)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/scan", bytes.NewReader(huge))
+	req.ContentLength = int64(len(huge))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("oversize body should NOT be accepted, got 202")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for oversize body, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestGetScanReport_NotFound(t *testing.T) {
 	store := memory.NewStore()
 	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)

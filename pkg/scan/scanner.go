@@ -37,11 +37,22 @@ func NewScanner(cfg config.KubevulnConfig) Scanner {
 	return &kubevulnScanner{
 		kubevulnURL: strings.TrimRight(cfg.URL, "/"),
 		namespace:   cfg.Namespace,
+		// Tight timeout: kubevuln's TriggerScan is documented as async —
+		// it accepts the request and returns immediately. The actual scan
+		// progress is observed by polling the VulnerabilityManifest CRD
+		// (controller.pollForResults). A 30s budget catches handshake +
+		// scheduling latency without pinning a goroutine for ten minutes
+		// against a hung kubevuln.
 		httpClient: &http.Client{
-			Timeout: 10 * time.Minute,
+			Timeout: 30 * time.Second,
 		},
 	}
 }
+
+// maxKubevulnResponseBytes caps how much of kubevuln's TriggerScan response
+// we'll read. The response is a small ack body — 64 KiB is generous, and
+// stops a hostile / misbehaving kubevuln from streaming us into OOM.
+const maxKubevulnResponseBytes = 64 * 1024
 
 // kubevulnScanRequest is the WebsocketScanCommand-compatible request for kubevuln.
 type kubevulnScanRequest struct {
@@ -110,7 +121,7 @@ func (s *kubevulnScanner) TriggerScan(ctx context.Context, req harbor.ScanReques
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxKubevulnResponseBytes))
 		return fmt.Errorf("kubevuln returned %d: %s", resp.StatusCode, string(respBody))
 	}
 

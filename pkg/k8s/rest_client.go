@@ -116,7 +116,31 @@ const (
 	apiGroup   = "spdx.softwarecomposition.kubescape.io"
 	apiVersion = "v1beta1"
 	resource   = "vulnerabilitymanifests"
+
+	// maxResponseBodyBytes caps how much of any single K8s API response we
+	// will read into memory. VulnerabilityManifest CRDs can be large
+	// (thousands of matches × CWE/CVSS entries) but should never approach
+	// this — 8 MiB is comfortable headroom and a hostile / runaway response
+	// can't OOM the pod. Default kube-apiserver MaxRequestBodySize is 100
+	// MiB, so we are well under.
+	maxResponseBodyBytes = 8 * 1024 * 1024
 )
+
+// readBodyCapped reads at most maxResponseBodyBytes from r. If the limit
+// is hit we return an explicit error rather than a silently-truncated body
+// — a partial Status JSON would parse as garbage and confuse the 404
+// classification (issue #37).
+func readBodyCapped(r io.Reader) ([]byte, error) {
+	limited := io.LimitReader(r, maxResponseBodyBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxResponseBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxResponseBodyBytes)
+	}
+	return body, nil
+}
 
 // cweOverlay captures CWE-related fields the canonical v1beta1 type does not
 // (yet) carry. It is decoded from the same response body as the canonical
@@ -159,7 +183,7 @@ func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, na
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBodyCapped(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading VulnerabilityManifest: %w", err)
 	}
@@ -213,12 +237,16 @@ func (c *RESTClient) ListVulnerabilityManifests(ctx context.Context, namespace, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readBodyCapped(resp.Body)
 		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
 	}
 
+	body, err := readBodyCapped(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading VulnerabilityManifest list: %w", err)
+	}
 	var list v1beta1.VulnerabilityManifestList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("decoding VulnerabilityManifest list: %w", err)
 	}
 
@@ -264,7 +292,7 @@ func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readBodyCapped(resp.Body)
 
 	switch resp.StatusCode {
 	case http.StatusOK:

@@ -28,6 +28,14 @@ const (
 
 	mimeTypeOCIManifest    = "application/vnd.oci.image.manifest.v1+json"
 	mimeTypeDockerManifest = "application/vnd.docker.distribution.manifest.v2+json"
+
+	// maxScanRequestBodyBytes caps how much of the POST /api/v1/scan body
+	// we will read into memory. Harbor's scan request is a tiny JSON
+	// document (registry URL + artifact digest + maybe a credentials
+	// header); 1 MiB is well over what's plausibly legit and stops a
+	// hostile / misbehaving Harbor instance from OOMing the pod with a
+	// huge body.
+	maxScanRequestBodyBytes = 1 * 1024 * 1024
 )
 
 // ReadinessCheck returns nil when the named subsystem is ready to serve scan
@@ -153,6 +161,10 @@ func (h *requestHandler) GetMetadata(w http.ResponseWriter, _ *http.Request) {
 
 // AcceptScanRequest accepts a scan request from Harbor, enqueues it, and returns a scan ID.
 func (h *requestHandler) AcceptScanRequest(w http.ResponseWriter, r *http.Request) {
+	// Bound the request body so a hostile / misbehaving caller can't OOM
+	// the pod with an unbounded POST. Harbor's scan request is tiny in
+	// practice; 1 MiB is well above any plausible legit value.
+	r.Body = http.MaxBytesReader(w, r.Body, maxScanRequestBodyBytes)
 	var scanRequest harbor.ScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&scanRequest); err != nil {
 		slog.Error("Failed to decode scan request", slog.String("err", err.Error()))
