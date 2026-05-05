@@ -159,17 +159,25 @@ func (c *RESTClient) GetVulnerabilityManifest(ctx context.Context, namespace, na
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading VulnerabilityManifest: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Narrow 404 handling: only the specific "named object missing"
+		// case is benign. A 404 for a missing namespace, an unserved
+		// resource path, or a broken aggregator must surface as an error
+		// — otherwise GetVulnerabilityManifest silently returns "no scan
+		// result yet" and the controller polls until timeout instead of
+		// failing fast. See issue #37.
+		if isNamedObjectNotFound(body, resource, name) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("K8s API 404 not for the requested object (likely missing namespace, unserved resource type, or broken path): %s", string(body))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var crd v1beta1.VulnerabilityManifest
@@ -256,17 +264,62 @@ func (c *RESTClient) Ping(ctx context.Context, namespace string) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNotFound:
-		// 200: probe CRD exists by that name (extremely unlikely)
-		// 404: doesn't exist; we still proved read access on the type
-		// Both signal the adapter can perform real scan lookups.
+	case http.StatusOK:
+		// Probe CRD exists by that name (extremely unlikely with our
+		// chosen name, but means we have read access — healthy).
 		return nil
+	case http.StatusNotFound:
+		// Healthy ONLY when the 404 is the specific "probe object not
+		// found" Status. A 404 for a missing namespace or an unserved
+		// resource type would falsely keep readiness green even though
+		// real scan lookups can't work. See issue #37.
+		if isNamedObjectNotFound(body, resource, readinessProbeName) {
+			return nil
+		}
+		return fmt.Errorf("k8s API 404 not for the probe object (likely missing namespace, unserved resource type, or broken path): %s", string(body))
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return fmt.Errorf("k8s API rejected VulnerabilityManifest GET (HTTP %d) — likely token rotation not picked up or RBAC missing", resp.StatusCode)
 	default:
-		return fmt.Errorf("k8s API ping returned %d", resp.StatusCode)
+		return fmt.Errorf("k8s API ping returned %d: %s", resp.StatusCode, string(body))
 	}
+}
+
+// isNamedObjectNotFound reports whether the body of a 404 response from
+// the K8s API is the specific "named object does not exist" Status — as
+// opposed to a path-level 404 (missing namespace, unserved resource type,
+// broken aggregator). The named-object case is benign for both the scan
+// path and the readiness probe; the others are configuration errors that
+// should surface to the caller. See issue #37.
+//
+// We require all four signals: a Status object body, reason=NotFound,
+// details.kind matches the requested resource (so a missing-namespace
+// 404 — whose details.kind would be "namespaces" — is rejected), and
+// details.name matches the requested object name.
+func isNamedObjectNotFound(body []byte, expectedResource, expectedName string) bool {
+	var st struct {
+		Kind    string `json:"kind"`
+		Reason  string `json:"reason"`
+		Details struct {
+			Name string `json:"name"`
+			Kind string `json:"kind"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil {
+		return false
+	}
+	if st.Kind != "Status" || st.Reason != "NotFound" {
+		return false
+	}
+	if st.Details.Kind != expectedResource {
+		return false
+	}
+	if st.Details.Name != expectedName {
+		return false
+	}
+	return true
 }
 
 // canonicalToManifest converts the kubescape/storage v1beta1 type into the

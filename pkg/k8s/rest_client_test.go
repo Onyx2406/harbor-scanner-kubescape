@@ -2,6 +2,8 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -224,9 +226,41 @@ func TestGetVulnerabilityManifest_CweExtraction(t *testing.T) {
 	}
 }
 
-func TestGetVulnerabilityManifest_NotFound(t *testing.T) {
+// notFoundStatusJSON builds a Kubernetes Status object body for a 404
+// "named object missing" response — the only 404 shape we treat as
+// benign (issue #37). Used by tests that want to simulate the K8s API
+// server's own NotFound payload. We marshal a real struct so the JSON
+// quoting is correct (a previous attempt that string-formatted via %q
+// produced invalid JSON).
+func notFoundStatusJSON(resourceKind, name string) string {
+	body := map[string]any{
+		"kind":       "Status",
+		"apiVersion": "v1",
+		"status":     "Failure",
+		"reason":     "NotFound",
+		"message":    fmt.Sprintf("%s %q not found", resourceKind, name),
+		"details": map[string]any{
+			"name": name,
+			"kind": resourceKind,
+		},
+		"code": 404,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		panic(err) // unreachable for the values we feed
+	}
+	return string(b)
+}
+
+// TestGetVulnerabilityManifest_NamedObjectNotFoundIsBenign covers the
+// "no scan result yet" path: when the K8s API returns a Status body for
+// the specific requested CRD name, the controller treats it as a normal
+// miss and keeps polling. See issue #37.
+func TestGetVulnerabilityManifest_NamedObjectNotFoundIsBenign(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.NotFound(w, &http.Request{})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("vulnerabilitymanifests", "missing")))
 	}))
 	defer srv.Close()
 
@@ -234,10 +268,79 @@ func TestGetVulnerabilityManifest_NotFound(t *testing.T) {
 
 	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "missing")
 	if err != nil {
-		t.Fatalf("expected nil error on 404, got %v", err)
+		t.Fatalf("expected nil error on benign object-missing 404, got %v", err)
 	}
 	if vm != nil {
-		t.Errorf("expected nil manifest on 404, got %+v", vm)
+		t.Errorf("expected nil manifest on benign 404, got %+v", vm)
+	}
+}
+
+// TestGetVulnerabilityManifest_BareNotFoundIsError pins the headline of
+// issue #37: a 404 with no Kubernetes Status body (e.g. when the apiserver
+// has no route for the resource at all, or an aggregator is missing) must
+// surface as an error so the controller fails fast instead of polling
+// until timeout for a scan it can never observe.
+func TestGetVulnerabilityManifest_BareNotFoundIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, &http.Request{}) // text/plain "404 page not found"
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "missing")
+	if err == nil {
+		t.Fatalf("expected error for bare 404 (broken path / unserved resource), got nil with vm=%+v", vm)
+	}
+	if vm != nil {
+		t.Errorf("expected nil manifest on error path, got %+v", vm)
+	}
+}
+
+// TestGetVulnerabilityManifest_NamespaceNotFoundIsError covers the
+// missing-namespace case from #37. K8s returns a Status whose
+// details.kind is "namespaces", not "vulnerabilitymanifests". We must
+// reject it so a misconfigured KUBEVULN_NAMESPACE doesn't masquerade as
+// a normal "no scan yet" response.
+func TestGetVulnerabilityManifest_NamespaceNotFoundIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("namespaces", "kubescape")))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "any-name")
+	if err == nil {
+		t.Fatalf("expected error for namespace-not-found 404, got nil with vm=%+v", vm)
+	}
+	if vm != nil {
+		t.Errorf("expected nil manifest, got %+v", vm)
+	}
+}
+
+// TestGetVulnerabilityManifest_NameMismatchIsError defends against a
+// crafted Status whose details.name doesn't match what we asked for.
+// Treat as broken because we did not get a definitive "the named
+// object is missing" answer about THIS object.
+func TestGetVulnerabilityManifest_NameMismatchIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("vulnerabilitymanifests", "different-name")))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	vm, err := c.GetVulnerabilityManifest(context.Background(), "kubescape", "asked-for-this-one")
+	if err == nil {
+		t.Fatalf("expected error when 404 names a different object, got nil with vm=%+v", vm)
+	}
+	if vm != nil {
+		t.Errorf("expected nil manifest, got %+v", vm)
 	}
 }
 
@@ -361,7 +464,9 @@ func TestPing_NotFoundIsHealthy(t *testing.T) {
 	var seenPath atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath.Store(r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("vulnerabilitymanifests", readinessProbeName)))
 	}))
 	defer srv.Close()
 
@@ -411,7 +516,9 @@ func TestPing_ProbesVulnerabilityManifestPath(t *testing.T) {
 	var seenPath atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath.Store(r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("vulnerabilitymanifests", readinessProbeName)))
 	}))
 	defer srv.Close()
 
@@ -424,5 +531,45 @@ func TestPing_ProbesVulnerabilityManifestPath(t *testing.T) {
 	wantPrefix := "/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/myns/vulnerabilitymanifests/"
 	if !strings.HasPrefix(path, wantPrefix) {
 		t.Errorf("Ping URL = %q, want prefix %q", path, wantPrefix)
+	}
+}
+
+// TestPing_BareNotFoundIsUnhealthy pins the headline of issue #37 for the
+// readiness path: a 404 with no Kubernetes Status body (e.g. unserved
+// resource type, broken aggregator, the apiserver doesn't know about the
+// CRD) must take the pod NotReady. Pre-#37 we accepted any 404 as
+// healthy, so a misconfigured cluster could silently keep serving 500s
+// to Harbor while the probe stayed green.
+func TestPing_BareNotFoundIsUnhealthy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, &http.Request{}) // text/plain "404 page not found"
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	err := c.Ping(context.Background(), "kubescape")
+	if err == nil {
+		t.Fatal("expected Ping to fail on a bare 404; broken-path conditions must surface as NotReady")
+	}
+}
+
+// TestPing_NamespaceNotFoundIsUnhealthy covers the other broad-404 case
+// from #37: when KUBEVULN_NAMESPACE doesn't exist, K8s returns a Status
+// with details.kind=namespaces. We must NOT treat that as proof the
+// adapter can serve scans.
+func TestPing_NamespaceNotFoundIsUnhealthy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundStatusJSON("namespaces", "kubescape")))
+	}))
+	defer srv.Close()
+
+	c := NewRESTClient(srv.URL, StaticTokenSource("test-token"))
+
+	err := c.Ping(context.Background(), "kubescape")
+	if err == nil {
+		t.Fatal("expected Ping to fail when the namespace itself is missing; readiness must not stay green")
 	}
 }
