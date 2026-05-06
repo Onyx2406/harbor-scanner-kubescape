@@ -481,6 +481,115 @@ func TestScan_RedisFailedWrite_UsesUncancelledCtx(t *testing.T) {
 	}
 }
 
+// cancelOnGetK8sClient cancels the controller's inbound ctx at the moment
+// GetVulnerabilityManifest is invoked, then returns `manifest`. This models
+// SIGTERM landing exactly between "scan reads results" and "scan persists
+// Finished" — the window issue #49 covers.
+type cancelOnGetK8sClient struct {
+	manifest *k8s.VulnerabilityManifest
+	cancel   context.CancelFunc
+}
+
+func (c *cancelOnGetK8sClient) GetVulnerabilityManifest(_ context.Context, _, _ string) (*k8s.VulnerabilityManifest, error) {
+	c.cancel()
+	return c.manifest, nil
+}
+
+func (c *cancelOnGetK8sClient) ListVulnerabilityManifests(_ context.Context, _, _ string) ([]k8s.VulnerabilityManifest, error) {
+	return nil, nil
+}
+
+func (c *cancelOnGetK8sClient) Ping(_ context.Context, _ string) error { return nil }
+
+// TestScan_CompletedScanSurvivesSIGTERM pins issue #49.
+//
+// Issue #29 fixed the FAILED-write path: when scanCtx was cancelled by the
+// shutdown sequence, the wrapper's Failed-status write reused that
+// cancelled ctx and the Redis SET silently failed, leaving the job
+// Pending until TTL. The fix routes Failed writes through a fresh ctx
+// with a short timeout.
+//
+// Issue #49 is the same problem in the success direction. The reuse-path
+// and post-poll SetFinished both used the same cancelable scanCtx. If
+// SIGTERM landed between scan completion and the final SET, SetFinished
+// returned context.Canceled, scan() bubbled that up, and the wrapper
+// dutifully wrote Failed — converting a *successful* scan into a failure.
+//
+// The fix is symmetric to #29: publishFinished uses a fresh background
+// ctx with the same terminalWriteTimeout cap. This test exercises the
+// reuse path against a real-ish Redis (miniredis): a fresh manifest is
+// available, so the only k8s call is the initial Get; we cancel the
+// inbound ctx inside that Get to simulate SIGTERM landing right before
+// SetFinished. Pre-fix the job would end Failed; post-fix it ends
+// Finished with the report intact.
+func TestScan_CompletedScanSurvivesSIGTERM(t *testing.T) {
+	fixedNow := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	now = func() time.Time { return fixedNow }
+	t.Cleanup(func() { now = time.Now })
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	store := persistenceredis.NewStore(rdb)
+	freshCtx := context.Background()
+
+	job := persistence.ScanJob{
+		ID: "job-sigterm-success",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"},
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(freshCtx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	scanCtx, cancel := context.WithCancel(context.Background())
+
+	scanner := &fakeScanner{}
+	fakeK8s := &cancelOnGetK8sClient{
+		manifest: &k8s.VulnerabilityManifest{
+			Name:        "nginx-fresh",
+			CreatedAt:   fixedNow.Add(-1 * time.Hour),
+			ToolVersion: "0.74.0",
+			Matches: []k8s.VulnMatch{
+				{ID: "CVE-2024-9999", Severity: "High", PkgName: "libfoo", PkgVersion: "1.0"},
+			},
+		},
+		cancel: cancel,
+	}
+
+	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
+	if err := c.Scan(scanCtx, job.ID); err != nil {
+		t.Fatalf("Scan: %v — a SIGTERM landing during the final SetFinished must NOT fail a completed scan", err)
+	}
+
+	// Reuse path — scanner must not have been triggered.
+	if scanner.triggers != 0 {
+		t.Errorf("scanner.triggers = %d, want 0 (reuse path)", scanner.triggers)
+	}
+
+	// Read back with a FRESH ctx — scanCtx is cancelled.
+	got, err := store.Get(freshCtx, job.ID)
+	if err != nil {
+		t.Fatalf("post-scan Get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("job missing after Scan; expected Finished status with report")
+	}
+	if got.Status != persistence.Finished {
+		t.Errorf("status = %s, want Finished — a successful scan was flipped to failure by ctx cancellation during the terminal SetFinished (issue #49 regression)", got.Status)
+	}
+	if len(got.Report.Vulnerabilities) != 1 {
+		t.Errorf("report.Vulnerabilities = %d, want 1 — the completed report did not land", len(got.Report.Vulnerabilities))
+	}
+}
+
 // fatalErrK8sClient simulates a K8s client that always returns
 // k8s.ErrFatalAPIRead — e.g. a cluster where RBAC is misconfigured or
 // the namespace is wrong.

@@ -64,10 +64,26 @@ func NewController(store persistence.Store, scanner Scanner, k8sClient k8s.Clien
 	}
 }
 
-// failedWriteTimeout caps the time we'll spend persisting a terminal
-// Failed status during shutdown. Long enough for a healthy Redis to ACK,
-// short enough that a stuck Redis can't block process exit.
-const failedWriteTimeout = 5 * time.Second
+// terminalWriteTimeout caps the time we'll spend persisting a terminal
+// status (Finished or Failed) during shutdown. Long enough for a healthy
+// Redis to ACK, short enough that a stuck Redis can't block process exit.
+//
+// Both terminal writes — Failed (issue #29) and Finished (issue #49) —
+// use a fresh, uncancelled context with this timeout instead of the
+// inbound scan context. SIGTERM cancels scanCtx; reusing it for the
+// terminal write would race the Redis SET to context.Canceled and either
+// (a) leak Pending until TTL or (b) convert a completed scan into Failed.
+const terminalWriteTimeout = 5 * time.Second
+
+// publishFinished persists the report and Finished status using a fresh
+// context derived from background. See issue #49: a SIGTERM landing
+// between scan completion and SetFinished must NOT convert a completed
+// scan into Failed.
+func (c *controller) publishFinished(scanJobID string, report harbor.ScanReport) error {
+	writeCtx, cancel := context.WithTimeout(context.Background(), terminalWriteTimeout)
+	defer cancel()
+	return c.store.SetFinished(writeCtx, scanJobID, report)
+}
 
 func (c *controller) Scan(ctx context.Context, scanJobID string) error {
 	if err := c.scan(ctx, scanJobID); err != nil {
@@ -82,7 +98,7 @@ func (c *controller) Scan(ctx context.Context, scanJobID string) error {
 		// Reusing it for the store write would race the Redis SET to
 		// context.Canceled and leave the job Pending until TTL expiry.
 		// See issue #29.
-		writeCtx, cancel := context.WithTimeout(context.Background(), failedWriteTimeout)
+		writeCtx, cancel := context.WithTimeout(context.Background(), terminalWriteTimeout)
 		defer cancel()
 		if updateErr := c.store.UpdateStatus(writeCtx, scanJobID, persistence.Failed, err.Error()); updateErr != nil {
 			slog.Error("Failed to update scan job status",
@@ -177,7 +193,9 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		// Atomic: publish report and Finished status in one store op so
 		// Harbor cannot poll a Finished status before the report lands,
 		// nor a Pending status while the report is already saved. See #31.
-		return c.store.SetFinished(ctx, scanJobID, report)
+		// Fresh ctx (issue #49): a SIGTERM here must not convert a
+		// completed scan into Failed.
+		return c.publishFinished(scanJobID, report)
 	} else if existing != nil {
 		staleSeenAt = existing.CreatedAt
 		slog.Info("Existing VulnerabilityManifest is stale, triggering fresh scan",
@@ -209,7 +227,12 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 	// Finished AND saves the report. Eliminates the crash window between
 	// UpdateReport and UpdateStatus that left reports invisible behind a
 	// stale Pending status (issue #31).
-	if err := c.store.SetFinished(ctx, scanJobID, report); err != nil {
+	//
+	// Fresh ctx (issue #49): scanCtx is cancelable on SIGTERM, but by the
+	// time we reach here the work is done and the only thing left is
+	// persisting success. Using the inbound ctx would race the Redis SET
+	// to context.Canceled and flip a completed scan to Failed.
+	if err := c.publishFinished(scanJobID, report); err != nil {
 		return err
 	}
 
