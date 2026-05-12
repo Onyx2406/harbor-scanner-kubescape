@@ -64,11 +64,16 @@ type kubevulnScanRequest struct {
 	Args            map[string]interface{} `json:"args,omitempty"`
 }
 
+// kubevulnRegistryAuth mirrors docker's registry.AuthConfig — the wire format
+// kubevuln deserializes. kubevuln's credential conversion only forwards
+// Username/Password and RegistryToken into its internal registry credentials,
+// so Bearer tokens MUST land in RegistryToken (json: registrytoken), not Auth.
 type kubevulnRegistryAuth struct {
 	Username      string `json:"username,omitempty"`
 	Password      string `json:"password,omitempty"`
 	Auth          string `json:"auth,omitempty"`
 	ServerAddress string `json:"serveraddress,omitempty"`
+	RegistryToken string `json:"registrytoken,omitempty"`
 }
 
 func (s *kubevulnScanner) TriggerScan(ctx context.Context, req harbor.ScanRequest) error {
@@ -190,7 +195,7 @@ func parseRegistryAuth(authorization string) (kubevulnRegistryAuth, error) {
 		}, nil
 	case "Bearer":
 		return kubevulnRegistryAuth{
-			Auth: tokens[1],
+			RegistryToken: tokens[1],
 		}, nil
 	default:
 		return kubevulnRegistryAuth{}, fmt.Errorf("unsupported auth type: %s", tokens[0])
