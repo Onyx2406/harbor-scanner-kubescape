@@ -180,6 +180,16 @@ func (h *requestHandler) AcceptScanRequest(w http.ResponseWriter, r *http.Reques
 
 	scanJobID := uuid.New().String()
 
+	// Separate the registry credential from the rest of the scan request so
+	// the credential never reaches the store. kubevuln needs it once, at
+	// trigger time; persisting it (in particular in Redis with a 1h TTL,
+	// see issue #15) would mean Harbor's Basic/Bearer registry header sat in
+	// durable storage for up to an hour past its useful life. The auth is
+	// held in this goroutine's closure and handed directly to
+	// controller.Scan; the persisted job has Authorization == "". See #55.
+	registryAuth := scanRequest.Registry.Authorization
+	scanRequest.Registry.Authorization = ""
+
 	job := persistence.ScanJob{
 		ID:      scanJobID,
 		Request: scanRequest,
@@ -206,7 +216,7 @@ func (h *requestHandler) AcceptScanRequest(w http.ResponseWriter, r *http.Reques
 			if h.scanWG != nil {
 				defer h.scanWG.Done()
 			}
-			if err := h.controller.Scan(h.scanCtx, scanJobID); err != nil {
+			if err := h.controller.Scan(h.scanCtx, scanJobID, registryAuth); err != nil {
 				slog.Error("Async scan failed",
 					slog.String("scan_job_id", scanJobID),
 					slog.String("err", err.Error()),

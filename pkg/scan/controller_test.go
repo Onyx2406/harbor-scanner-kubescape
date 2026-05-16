@@ -78,7 +78,7 @@ func TestScan_NoK8sClient_ReturnsError(t *testing.T) {
 	// before reaching it.
 	c := NewController(store, nil, nil, "kubescape", DefaultReuseTTL)
 
-	err := c.Scan(ctx, job.ID)
+	err := c.Scan(ctx, job.ID, "")
 	if err == nil {
 		t.Fatal("expected error when k8sClient is nil, got nil (Harbor would receive a false-clean report)")
 	}
@@ -221,7 +221,7 @@ func TestScan_FreshManifestIsReused(t *testing.T) {
 			scanner := &fakeScanner{}
 
 			c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
-			if err := c.Scan(ctx, job.ID); err != nil {
+			if err := c.Scan(ctx, job.ID, ""); err != nil {
 				t.Fatalf("Scan: %v", err)
 			}
 
@@ -281,7 +281,7 @@ func TestScan_StaleManifestTriggersFreshScan(t *testing.T) {
 	scanner := &triggerCancellingScanner{cancel: cancel}
 
 	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
-	_ = c.Scan(ctx, job.ID) // expected to fail with context.Canceled after trigger
+	_ = c.Scan(ctx, job.ID, "") // expected to fail with context.Canceled after trigger
 
 	if scanner.triggers != 1 {
 		t.Errorf("scanner triggered %d time(s); stale manifest must trigger exactly one fresh scan", scanner.triggers)
@@ -296,6 +296,84 @@ type triggerCancellingScanner struct {
 func (s *triggerCancellingScanner) TriggerScan(_ context.Context, _ harbor.ScanRequest) error {
 	s.triggers++
 	s.cancel()
+	return nil
+}
+
+// TestScan_ForwardsRegistryAuthToTriggerScan_NotStored pins issue #55: the
+// in-memory registryAuth passed to Scan must reach the scanner's TriggerScan
+// call (so kubevuln can authenticate against the registry), but it must NOT
+// be persisted back into the store at any point — neither the initial Create
+// nor any UpdateStatus / SetFinished write may leave the credential in
+// durable state.
+func TestScan_ForwardsRegistryAuthToTriggerScan_NotStored(t *testing.T) {
+	fixedNow := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	now = func() time.Time { return fixedNow }
+	t.Cleanup(func() { now = time.Now })
+
+	store := memory.NewStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// Seed an auth-stripped job — that's the contract the handler enforces.
+	job := persistence.ScanJob{
+		ID: "job-auth-forward",
+		Request: harbor.ScanRequest{
+			Registry: harbor.Registry{URL: "https://core.harbor.domain"}, // no Authorization
+			Artifact: harbor.Artifact{
+				Repository: "library/nginx",
+				Digest:     "sha256:abcdef0123456789",
+			},
+		},
+		Status: persistence.Queued,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// No existing CRD → controller triggers the scanner. The trigger fake
+	// records the request it saw and cancels the ctx so the subsequent poll
+	// bails out immediately instead of waiting 5s for a CRD that won't come.
+	scanner := &authRecordingScanner{cancel: cancel}
+	fakeK8s := &fakeK8sClient{manifest: nil}
+
+	const sensitiveAuth = "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"
+	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
+	_ = c.Scan(ctx, job.ID, sensitiveAuth) // expected to fail with ctx.Canceled after trigger
+
+	if scanner.triggers != 1 {
+		t.Fatalf("scanner triggered %d time(s); expected exactly 1", scanner.triggers)
+	}
+	if got := scanner.seenAuth; got != sensitiveAuth {
+		t.Errorf("TriggerScan saw Authorization=%q, want %q (auth wasn't re-attached for the live scan)", got, sensitiveAuth)
+	}
+
+	// The store, on the other hand, must still hold an empty Authorization.
+	// The controller's UpdateStatus / Failed write must not have round-tripped
+	// the credential we just attached locally for the trigger call.
+	stored, err := store.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := stored.Request.Registry.Authorization; got != "" {
+		t.Errorf("Authorization persisted to store = %q, want \"\" (issue #55 regression: controller leaked credential back into durable state)", got)
+	}
+}
+
+// authRecordingScanner records the harbor.ScanRequest it was triggered with
+// and cancels its context so the controller's subsequent poll loop returns
+// quickly. Used by TestScan_ForwardsRegistryAuthToTriggerScan_NotStored.
+type authRecordingScanner struct {
+	triggers int
+	seenAuth string
+	cancel   context.CancelFunc
+}
+
+func (s *authRecordingScanner) TriggerScan(_ context.Context, req harbor.ScanRequest) error {
+	s.triggers++
+	s.seenAuth = req.Registry.Authorization
+	if s.cancel != nil {
+		s.cancel()
+	}
 	return nil
 }
 
@@ -363,7 +441,7 @@ func TestScan_StaleManifestNotReturnedByPoll(t *testing.T) {
 	}
 
 	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
-	if err := c.Scan(ctx, job.ID); err != nil {
+	if err := c.Scan(ctx, job.ID, ""); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 
@@ -461,7 +539,7 @@ func TestScan_RedisFailedWrite_UsesUncancelledCtx(t *testing.T) {
 
 	// Run Scan with the already-cancelled ctx, mimicking what happens
 	// after main.go's cancelScans() fires on SIGTERM.
-	_ = c.Scan(cancelledCtx, job.ID)
+	_ = c.Scan(cancelledCtx, job.ID, "")
 
 	// Read the persisted state with a FRESH ctx — the cancelled one
 	// would itself fail the Redis GET. We want to know what was actually
@@ -565,7 +643,7 @@ func TestScan_CompletedScanSurvivesSIGTERM(t *testing.T) {
 	}
 
 	c := NewController(store, scanner, fakeK8s, "kubescape", 24*time.Hour)
-	if err := c.Scan(scanCtx, job.ID); err != nil {
+	if err := c.Scan(scanCtx, job.ID, ""); err != nil {
 		t.Fatalf("Scan: %v — a SIGTERM landing during the final SetFinished must NOT fail a completed scan", err)
 	}
 
@@ -637,7 +715,7 @@ func TestScan_FatalAPIError_BailsImmediately(t *testing.T) {
 	scanner := &fakeScanner{}
 
 	c := NewController(store, scanner, fakeK8s, "kubescape", DefaultReuseTTL)
-	err := c.Scan(ctx, job.ID)
+	err := c.Scan(ctx, job.ID, "")
 	if err == nil {
 		t.Fatal("expected Scan to fail with the fatal API error, got nil")
 	}
@@ -773,7 +851,7 @@ func TestScan_TransientInitError_StaleGuardStillHolds(t *testing.T) {
 	}
 
 	c := NewController(store, &fakeScanner{}, fakeK8s, "kubescape", DefaultReuseTTL)
-	if err := c.Scan(ctx, job.ID); err != nil {
+	if err := c.Scan(ctx, job.ID, ""); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 
