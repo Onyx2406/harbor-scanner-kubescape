@@ -81,9 +81,13 @@ helm install harbor-scanner-kubescape ./charts/harbor-scanner-kubescape \
   --namespace harbor \
   --set tls.enabled=true \
   --set tls.secretName=harbor-scanner-kubescape-tls \
-  --set scanner.apiAddr=":8443" \
   --set service.port=8443
 ```
+
+`service.port` is the single source of truth for the listener port: the chart
+derives `SCANNER_API_ADDR=":<port>"`, the container port, and the probe targets
+from it, so switching to TLS only requires `service.port=8443` (no separate
+listener address to keep in sync).
 
 ### Graceful shutdown
 
