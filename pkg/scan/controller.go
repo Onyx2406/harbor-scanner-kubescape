@@ -36,8 +36,14 @@ var now = time.Now
 // 1. Check if a fresh VulnerabilityManifest CRD already exists for the image
 // 2. If yes, transform and return it
 // 3. If no, trigger kubevuln ScanCVE, then poll for the CRD
+//
+// registryAuth carries the Harbor registry credential (the raw
+// `registry.authorization` header) needed to authenticate the kubevuln
+// trigger. It is passed in-memory and is intentionally NOT read from the
+// stored ScanJob — the store is auth-stripped so credentials never sit in
+// durable state past the goroutine that's actively using them. See issue #55.
 type Controller interface {
-	Scan(ctx context.Context, scanJobID string) error
+	Scan(ctx context.Context, scanJobID string, registryAuth string) error
 }
 
 type controller struct {
@@ -85,8 +91,8 @@ func (c *controller) publishFinished(scanJobID string, report harbor.ScanReport)
 	return c.store.SetFinished(writeCtx, scanJobID, report)
 }
 
-func (c *controller) Scan(ctx context.Context, scanJobID string) error {
-	if err := c.scan(ctx, scanJobID); err != nil {
+func (c *controller) Scan(ctx context.Context, scanJobID string, registryAuth string) error {
+	if err := c.scan(ctx, scanJobID, registryAuth); err != nil {
 		slog.Error("Scan failed",
 			slog.String("scan_job_id", scanJobID),
 			slog.String("err", err.Error()),
@@ -119,7 +125,7 @@ func (c *controller) Scan(ctx context.Context, scanJobID string) error {
 // scanned). See issue #6.
 var ErrK8sUnavailable = fmt.Errorf("kubernetes client unavailable: cannot observe VulnerabilityManifest CRDs")
 
-func (c *controller) scan(ctx context.Context, scanJobID string) error {
+func (c *controller) scan(ctx context.Context, scanJobID string, registryAuth string) error {
 	job, err := c.store.Get(ctx, scanJobID)
 	if err != nil {
 		return err
@@ -211,7 +217,13 @@ func (c *controller) scan(ctx context.Context, scanJobID string) error {
 		slog.String("scan_job_id", scanJobID),
 	)
 
-	if err := c.scanner.TriggerScan(ctx, job.Request); err != nil {
+	// Build the kubevuln request just-in-time with the in-memory credential.
+	// The persisted job.Request has Authorization stripped (see handler /
+	// issue #55), so credentials never sit in the store; we re-attach them
+	// here in a local copy that lives only for the TriggerScan call.
+	scanReq := job.Request
+	scanReq.Registry.Authorization = registryAuth
+	if err := c.scanner.TriggerScan(ctx, scanReq); err != nil {
 		return fmt.Errorf("triggering kubevuln scan: %w", err)
 	}
 

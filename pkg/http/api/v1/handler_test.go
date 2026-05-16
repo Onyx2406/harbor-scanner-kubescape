@@ -96,6 +96,95 @@ func TestAcceptScanRequest_Valid(t *testing.T) {
 	}
 }
 
+// TestAcceptScanRequest_StripsRegistryAuthFromStore pins issue #55: the
+// Harbor `registry.authorization` header MUST NOT survive into the persisted
+// ScanJob. It is needed transiently to authenticate the kubevuln trigger and
+// is threaded to the controller in-memory; the store sees Authorization == "".
+//
+// Failure mode this test guards against: Redis-backed deployments would keep
+// the raw Basic/Bearer header in durable state for up to the job TTL (1h by
+// default), well past its useful life.
+func TestAcceptScanRequest_StripsRegistryAuthFromStore(t *testing.T) {
+	store := memory.NewStore()
+	capture := &authCapturingController{called: make(chan struct{})}
+	handler := NewAPIHandler(
+		config.BuildInfo{Version: "test"},
+		config.Config{},
+		store,
+		capture,
+		nil, // scanCtx
+		nil, // scanWG
+	)
+
+	const sensitiveAuth = "Basic dXNlcjpzM2NyZXQ=" // user:s3cret
+	scanReq := harbor.ScanRequest{
+		Registry: harbor.Registry{
+			URL:           "https://core.harbor.domain",
+			Authorization: sensitiveAuth,
+		},
+		Artifact: harbor.Artifact{
+			Repository: "library/nginx",
+			Digest:     "sha256:abc123",
+		},
+	}
+	body, _ := json.Marshal(scanReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/scan", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var scanResp harbor.ScanResponse
+	if err := json.NewDecoder(w.Body).Decode(&scanResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// The store must hold a job without the auth header.
+	stored, err := store.Get(context.Background(), scanResp.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected job in store, got nil")
+	}
+	if got := stored.Request.Registry.Authorization; got != "" {
+		t.Errorf("Authorization persisted to store = %q, want \"\" (issue #55 regression: credentials leaked into durable state)", got)
+	}
+
+	// The credential must still reach the controller's Scan call so kubevuln
+	// can authenticate; otherwise the strip would break scanning.
+	select {
+	case <-capture.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller.Scan was not invoked within 2s")
+	}
+	if got := capture.gotAuth; got != sensitiveAuth {
+		t.Errorf("controller.Scan registryAuth = %q, want %q (auth was stripped but not threaded through)", got, sensitiveAuth)
+	}
+	if got := capture.gotJobID; got != scanResp.ID {
+		t.Errorf("controller.Scan scanJobID = %q, want %q", got, scanResp.ID)
+	}
+}
+
+// authCapturingController records the registryAuth and scanJobID passed to
+// Scan so a test can assert what the handler forwarded.
+type authCapturingController struct {
+	called   chan struct{}
+	gotAuth  string
+	gotJobID string
+	once     sync.Once
+}
+
+func (a *authCapturingController) Scan(_ context.Context, scanJobID string, registryAuth string) error {
+	a.once.Do(func() {
+		a.gotJobID = scanJobID
+		a.gotAuth = registryAuth
+		close(a.called)
+	})
+	return nil
+}
+
 func TestAcceptScanRequest_MissingFields(t *testing.T) {
 	store := memory.NewStore()
 	handler := NewAPIHandler(config.BuildInfo{}, config.Config{}, store, nil, nil, nil)
@@ -343,7 +432,7 @@ type blockingController struct {
 	store     persistence.Store
 }
 
-func (b *blockingController) Scan(ctx context.Context, scanJobID string) error {
+func (b *blockingController) Scan(ctx context.Context, scanJobID string, _ string) error {
 	b.gotCtx = ctx
 	close(b.started)
 	<-ctx.Done()

@@ -63,9 +63,16 @@ func (s *Severity) UnmarshalJSON(b []byte) error {
 }
 
 // Registry represents a Docker Registry.
+//
+// Authorization is treated as transient credential material: the scan handler
+// captures it from the incoming Harbor request, strips it from any ScanRequest
+// it persists, and threads it directly to the kubevuln trigger via the
+// Controller. Persistence backends must therefore receive Registry values with
+// Authorization == "" — credentials are not part of stored job state. See
+// issue #55.
 type Registry struct {
 	URL           string `json:"url"`
-	Authorization string `json:"authorization"`
+	Authorization string `json:"authorization,omitempty"`
 }
 
 // Artifact represents a container image artifact.
