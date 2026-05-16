@@ -6,6 +6,9 @@
 {{- if and (eq (default "memory" .Values.persistence.backend) "redis") (not .Values.persistence.redis.url) (not .Values.persistence.redis.secretName) -}}
 {{- fail "persistence.backend=redis requires either persistence.redis.url or persistence.redis.secretName to be set." -}}
 {{- end -}}
+{{- if hasKey (default dict .Values.scanner) "apiAddr" -}}
+{{- fail "scanner.apiAddr has been removed; set service.port instead. The listener address is derived from service.port (e.g. service.port=8443 for TLS) so the container, Service, and probes stay in sync. See https://github.com/Onyx2406/harbor-scanner-kubescape/issues/53." -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,7 +36,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: SCANNER_API_ADDR
-              value: {{ .Values.scanner.apiAddr | quote }}
+              value: {{ printf ":%d" (int .Values.service.port) | quote }}
             - name: KUBEVULN_URL
               value: {{ .Values.scanner.kubevulnURL | quote }}
             - name: KUBEVULN_NAMESPACE
