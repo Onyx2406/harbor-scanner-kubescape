@@ -7,7 +7,7 @@
 {{- fail "persistence.backend=redis requires either persistence.redis.url or persistence.redis.secretName to be set." -}}
 {{- end -}}
 {{- if hasKey (default dict .Values.scanner) "apiAddr" -}}
-{{- fail "scanner.apiAddr has been removed; set service.port instead. The listener address is derived from service.port (e.g. service.port=8443 for TLS) so the container, Service, and probes stay in sync. See https://github.com/Onyx2406/harbor-scanner-kubescape/issues/53." -}}
+{{- fail "scanner.apiAddr has been removed; set service.port instead. The listener address is derived from service.port (e.g. service.port=8443 for TLS) so the container, Service, and probes stay in sync. See https://github.com/goharbor/harbor-scanner-kubescape/issues/53." -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
