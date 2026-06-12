@@ -8,7 +8,10 @@ home: https://github.com/goharbor/harbor-scanner-kubescape
 sources:
   - https://github.com/goharbor/harbor-scanner-kubescape
 maintainers:
-  - name: Onyx2406
+  - name: Nucleus Systems
+    url: https://github.com/Nucleus-Systems
+  - name: Yash Sancheti
+    url: https://github.com/Onyx2406
 keywords:
   - harbor
   - kubescape

@@ -2,6 +2,10 @@
 
 A [Harbor](https://goharbor.io) scanner adapter that integrates [Kubescape](https://kubescape.io)'s image vulnerability scanning capabilities (powered by [Grype](https://github.com/anchore/grype) via [kubevuln](https://github.com/kubescape/kubevuln)) as a pluggable scanner in Harbor.
 
+> **Community integration**
+>
+> This project is currently maintained by [Nucleus Systems](https://nucleus-systems.com) as a community integration, pending donation to the [`goharbor`](https://github.com/goharbor) organization. The adapter implements the Harbor scanner integration layer; vulnerability analysis is performed by Kubescape's `kubevuln` component, powered by Grype and Syft.
+
 ## Overview
 
 This adapter implements the [Harbor Pluggable Scanner API v1.2](https://github.com/goharbor/pluggable-scanner-spec) and bridges Harbor's scanning workflow with Kubescape's `kubevuln` component for image vulnerability analysis.
