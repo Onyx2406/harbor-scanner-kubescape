@@ -4,7 +4,7 @@ A [Harbor](https://goharbor.io) scanner adapter that integrates [Kubescape](http
 
 > **Community integration**
 >
-> This project is currently maintained by [Nucleus Systems](https://nucleus-systems.com) as a community integration, pending donation to the [`goharbor`](https://github.com/goharbor) organization. The adapter implements the Harbor scanner integration layer; vulnerability analysis is performed by Kubescape's `kubevuln` component, powered by Grype and Syft.
+> This project is currently maintained by [Digital Trust Futures Foundation ](https://digitaltrustfuturesfoundation.org/) as a community integration, pending donation to the [`goharbor`](https://github.com/goharbor) organization. The adapter implements the Harbor scanner integration layer; vulnerability analysis is performed by Kubescape's `kubevuln` component, powered by Grype and Syft.
 
 ## Overview
 
